@@ -7,4 +7,5 @@ public enum PokeTradeType
     Seed,
     Clone,
     Dump,
+    EditReturn,
 }

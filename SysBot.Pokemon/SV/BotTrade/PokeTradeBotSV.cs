@@ -820,6 +820,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             PokeTradeType.Random => await HandleRandomLedy(sav, poke, offered, toSend, partnerID, token).ConfigureAwait(false),
             PokeTradeType.Clone => await HandleClone(sav, poke, offered, oldEC, token).ConfigureAwait(false),
+            PokeTradeType.EditReturn => await HandleEditReturn(sav, poke, offered, toSend, token).ConfigureAwait(false),
             _ => (toSend, PokeTradeResult.Success),
         };
     }
@@ -872,6 +873,103 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         await SetBoxPokemonAbsolute(BoxStartOffset, clone, token, sav).ConfigureAwait(false);
 
         return (clone, PokeTradeResult.Success);
+    }
+
+    private async Task<(PK9 toSend, PokeTradeResult check)> HandleEditReturn(
+        SAV9SV sav, PokeTradeDetail<PK9> poke, PK9 offered, PK9 target, CancellationToken token)
+    {
+        // Species/form gate
+        if (offered.Species != target.Species || offered.Form != target.Form)
+        {
+            poke.SendNotification(this, $"Edit-return keeps your Pokémon's species. You offered {GetSpeciesName(offered.Species)} but the set is for {GetSpeciesName(target.Species)}. Offer the matching species.");
+            return (offered, PokeTradeResult.TrainerRequestBad);
+        }
+
+        // The offered mon must be legal
+        var la = new LegalityAnalysis(offered);
+        if (!la.Valid)
+        {
+            Log($"Edit-return request (from {poke.Trainer.TrainerName}) has detected an invalid Pokémon: {GetSpeciesName(offered.Species)}.");
+            if (DumpSetting.Dump)
+                DumpPokemon(DumpSetting.DumpFolder, "hacked", offered);
+
+            var report = la.Report();
+            Log(report);
+            poke.SendNotification(this, "The Pokémon you offered isn't legal per PKHeX, so I won't edit it. Exiting trade.");
+            return (offered, PokeTradeResult.IllegalTrade);
+        }
+
+        // Build the edited mon on a clone of the offered mon
+        var edited = offered.Clone();
+
+        // Copy only the competitive layer from target
+        edited.EV_HP = target.EV_HP;
+        edited.EV_ATK = target.EV_ATK;
+        edited.EV_DEF = target.EV_DEF;
+        edited.EV_SPA = target.EV_SPA;
+        edited.EV_SPD = target.EV_SPD;
+        edited.EV_SPE = target.EV_SPE;
+
+        edited.HeldItem = target.HeldItem;
+
+        edited.Ability = target.Ability;
+        edited.AbilityNumber = target.AbilityNumber;
+
+        edited.StatNature = target.StatNature;
+
+        edited.TeraTypeOverride = target.TeraTypeOverride;
+
+        edited.SetMoves(new ushort[] { target.Move1, target.Move2, target.Move3, target.Move4 }, true);
+        var laRelearn = new LegalityAnalysis(edited);
+        Span<ushort> relearn = stackalloc ushort[4];
+        laRelearn.GetSuggestedRelearnMoves(relearn);
+        edited.SetRelearnMoves(relearn);
+
+        edited.RefreshChecksum();
+
+        // Legality re-check with guarded repair fallback
+        var laEdit = new LegalityAnalysis(edited);
+        if (!laEdit.Valid)
+        {
+            edited = (PK9)edited.LegalizePokemon();
+            edited.RefreshChecksum();
+            laEdit = new LegalityAnalysis(edited);
+        }
+        if (!laEdit.Valid)
+        {
+            Log(laEdit.Report());
+            poke.SendNotification(this, "I couldn't make that set legal for your Pokémon (a move or ability may not be obtainable). Exiting trade.");
+            poke.SendNotification(this, laEdit.Report());
+            return (offered, PokeTradeResult.IllegalTrade);
+        }
+
+        // Provenance hard-guard: abort if identity drifted
+        if (edited.EncryptionConstant != offered.EncryptionConstant ||
+            edited.PID != offered.PID ||
+            edited.ID32 != offered.ID32 ||
+            edited.OriginalTrainerName != offered.OriginalTrainerName ||
+            edited.OriginalTrainerGender != offered.OriginalTrainerGender ||
+            edited.Version != offered.Version ||
+            edited.Language != offered.Language ||
+            edited.MetLocation != offered.MetLocation ||
+            edited.MetLevel != offered.MetLevel ||
+            edited.EggLocation != offered.EggLocation ||
+            edited.Ball != offered.Ball ||
+            ((IHomeTrack)edited).Tracker != ((IHomeTrack)offered).Tracker)
+        {
+            Log($"Edit-return provenance guard triggered for {poke.Trainer.TrainerName}.");
+            poke.SendNotification(this, "Safety check failed — I did not alter your Pokémon.");
+            return (offered, PokeTradeResult.IllegalTrade);
+        }
+
+        // Success: inject the edited mon and return
+        poke.SendNotification(this, $"**Editing your {GetSpeciesName(edited.Species)}** with the requested set — trading it back now.");
+        Log($"Edit-return: applied set to {GetSpeciesName(edited.Species)} for {poke.Trainer.TrainerName}.");
+
+        await Click(A, 0_800, token).ConfigureAwait(false);
+        await SetBoxPokemonAbsolute(BoxStartOffset, edited, token, sav).ConfigureAwait(false);
+
+        return (edited, PokeTradeResult.Success);
     }
 
     private async Task<(PK9 toSend, PokeTradeResult check)> HandleRandomLedy(SAV9SV sav, PokeTradeDetail<PK9> poke, PK9 offered, PK9 toSend, PartnerDataHolder partner, CancellationToken token)
