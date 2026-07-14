@@ -1,4 +1,6 @@
 ﻿using PKHeX.Core;
+using SysBot.Pokemon;
+using SysBot.Pokemon.GenBridge;
 using SysBot.Pokemon.Discord;
 using SysBot.Pokemon.Twitch;
 using System.Threading;
@@ -20,6 +22,7 @@ public class PokeBotRunnerImpl<T> : PokeBotRunner<T> where T : PKM, new()
     {
         AddDiscordBot(Hub.Config.Discord);
         AddTwitchBot(Hub.Config.Twitch);
+        GenBridge<T>.TryStart(Hub);
     }
 
     private void AddTwitchBot(TwitchSettings config)
