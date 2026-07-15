@@ -34,25 +34,86 @@ public abstract class RoutineExecutor<T>(IConsoleBotManaged<IConsoleConnection, 
     /// <param name="token">Cancel this token to have the bot stop looping.</param>
     public async Task RunAsync(CancellationToken token)
     {
-        // A headless service can start while the console is asleep or offline; keep trying
-        // instead of crashing so the bot comes up on its own when the console returns.
-        while (true)
+        // Connectivity loss must never permanently end the bot; only a stop request (token cancellation) does.
+        while (!token.IsCancellationRequested)
         {
+            // Connect phase: retry until connected or cancelled.
+            while (true)
+            {
+                try
+                {
+                    Connection.Connect();
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log($"Initial connection failed: {ex.Message} Retrying in 30 seconds...");
+                    try
+                    {
+                        await Task.Delay(30_000, token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
+                if (token.IsCancellationRequested)
+                    break;
+            }
+            if (token.IsCancellationRequested)
+                break;
+
+            // Session phase: run InitialStartup then MainLoop.
             try
             {
-                Connection.Connect();
+                Log("Initializing connection with console...");
+                await InitialStartup(token).ConfigureAwait(false);
+                await MainLoop(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
                 break;
             }
             catch (Exception ex)
             {
-                Log($"Initial connection failed: {ex.Message} Retrying in 30 seconds...");
+                Log($"Bot session faulted: {ex}");
+            }
+
+            // After the session phase: if we were told to stop, exit. Otherwise, reinitialize.
+            if (token.IsCancellationRequested)
+                break;
+
+            Log("Bot session ended without a stop request; reinitializing in 30 seconds...");
+
+            // Best-effort disconnect so the next connect phase starts from a fresh socket.
+            try
+            {
+                Connection.Disconnect();
+            }
+            catch (Exception ex)
+            {
+                Log($"Disconnect during reinitialization failed: {ex.Message}");
+            }
+
+            try
+            {
                 await Task.Delay(30_000, token).ConfigureAwait(false);
             }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
         }
-        Log("Initializing connection with console...");
-        await InitialStartup(token).ConfigureAwait(false);
-        await MainLoop(token).ConfigureAwait(false);
-        Connection.Disconnect();
+
+        // Final best-effort disconnect.
+        try
+        {
+            Connection.Disconnect();
+        }
+        catch (Exception ex)
+        {
+            Log($"Final disconnect failed: {ex.Message}");
+        }
     }
 
     public abstract Task MainLoop(CancellationToken token);

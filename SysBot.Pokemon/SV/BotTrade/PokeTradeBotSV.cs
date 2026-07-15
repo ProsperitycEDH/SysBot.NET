@@ -79,11 +79,21 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         }
         catch (Exception e)
         {
-            Log(e.Message);
+            Log($"Trade loop ended by exception: {e}");
         }
 
         Log($"Ending {nameof(PokeTradeBotSV)} loop.");
-        await HardStop().ConfigureAwait(false);
+
+        // Cleanup presses buttons on the console, which is unreachable in exactly the failure
+        // case that ends the loop — a cleanup failure must not escape and kill the executor.
+        try
+        {
+            await HardStop().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log($"Exit cleanup failed (console unreachable?): {ex.Message}");
+        }
     }
 
     public override Task HardStop()
