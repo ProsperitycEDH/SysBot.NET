@@ -123,16 +123,22 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
     {
         var size = (length * 2) + 1;
         var buffer = ArrayPool<byte>.Shared.Rent(size);
+
+        // A console that vanishes silently (sleep, power loss, WiFi drop without RST) never
+        // errors the socket — receives just block forever. Bound each command with a deadline
+        // so silence becomes a failure that routes into the reconnect path.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(15_000);
         try
         {
             // Send directly via Connection to avoid nested reconnect layers.
-            await Connection.SendAsync(cmd, token).ConfigureAwait(false);
+            await Connection.SendAsync(cmd, deadline.Token).ConfigureAwait(false);
 
             var mem = buffer.AsMemory()[..size];
             int total = 0;
             while (total < size)
             {
-                int received = await Connection.ReceiveAsync(mem[total..], token).ConfigureAwait(false);
+                int received = await Connection.ReceiveAsync(mem[total..], deadline.Token).ConfigureAwait(false);
                 if (received == 0)
                     throw new SocketException(); // peer closed the connection
                 total += received;
@@ -148,6 +154,10 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
 
             return DecodeResult(mem[..total], length);
         }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw new TimeoutException("No response from the console within 15 seconds.");
+        }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer, true);
@@ -160,7 +170,7 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
         {
             return await ReadBytesFromCmdOnceAsync(cmd, length, token).ConfigureAwait(false);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             Log($"{nameof(ReadBytesFromCmdAsync)} failed: {ex.Message}. Attempting reconnect...");
             if (await TryReconnectAsync(token).ConfigureAwait(false))

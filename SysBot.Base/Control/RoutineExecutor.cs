@@ -34,7 +34,21 @@ public abstract class RoutineExecutor<T>(IConsoleBotManaged<IConsoleConnection, 
     /// <param name="token">Cancel this token to have the bot stop looping.</param>
     public async Task RunAsync(CancellationToken token)
     {
-        Connection.Connect();
+        // A headless service can start while the console is asleep or offline; keep trying
+        // instead of crashing so the bot comes up on its own when the console returns.
+        while (true)
+        {
+            try
+            {
+                Connection.Connect();
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log($"Initial connection failed: {ex.Message} Retrying in 30 seconds...");
+                await Task.Delay(30_000, token).ConfigureAwait(false);
+            }
+        }
         Log("Initializing connection with console...");
         await InitialStartup(token).ConfigureAwait(false);
         await MainLoop(token).ConfigureAwait(false);
