@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -70,31 +71,114 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
         InitializeSocket();
     }
 
+    private async Task<bool> TryReconnectAsync(CancellationToken token)
+    {
+        int[] delays = { 2_000, 4_000, 8_000, 15_000, 30_000 };
+        for (int i = 0; i < delays.Length; i++)
+        {
+            try
+            {
+                await Task.Delay(delays[i], token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+
+            try
+            {
+                InitializeSocket();
+                Connect();
+                Log("Reconnected to the console.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log($"Reconnect attempt {i + 1}/{delays.Length} failed: {ex.Message}");
+            }
+        }
+        LogError("Reconnection to the console failed after all attempts.");
+        return false;
+    }
+
     /// <summary> Only call this if you are sending small commands. </summary>
-    public ValueTask<int> SendAsync(byte[] buffer, CancellationToken token) => Connection.SendAsync(buffer, token);
+    public async ValueTask<int> SendAsync(byte[] buffer, CancellationToken token)
+    {
+        try
+        {
+            return await Connection.SendAsync(buffer, token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is SocketException or System.IO.IOException or ObjectDisposedException)
+        {
+            Log($"Send failed: {ex.Message}. Attempting reconnect...");
+            if (await TryReconnectAsync(token).ConfigureAwait(false))
+            {
+                return await Connection.SendAsync(buffer, token).ConfigureAwait(false);
+            }
+            throw;
+        }
+    }
+
+    private async Task<byte[]> ReadBytesFromCmdOnceAsync(byte[] cmd, int length, CancellationToken token)
+    {
+        var size = (length * 2) + 1;
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
+        try
+        {
+            // Send directly via Connection to avoid nested reconnect layers.
+            await Connection.SendAsync(cmd, token).ConfigureAwait(false);
+
+            var mem = buffer.AsMemory()[..size];
+            int total = 0;
+            while (total < size)
+            {
+                int received = await Connection.ReceiveAsync(mem[total..], token).ConfigureAwait(false);
+                if (received == 0)
+                    throw new SocketException(); // peer closed the connection
+                total += received;
+
+                // If we hit the '\n' terminator, stop reading.
+                if (buffer[total - 1] == (byte)'\n')
+                    break;
+            }
+
+            // If we stopped on the terminator with fewer bytes than expected, the response is short/garbage.
+            if (total < size)
+                throw new InvalidOperationException($"Short response: expected {size} bytes but received {total} (terminated early).");
+
+            return DecodeResult(mem[..total], length);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer, true);
+        }
+    }
 
     private async Task<byte[]> ReadBytesFromCmdAsync(byte[] cmd, int length, CancellationToken token)
     {
         try
         {
-            await SendAsync(cmd, token).ConfigureAwait(false);
-            var size = (length * 2) + 1;
-            var buffer = ArrayPool<byte>.Shared.Rent(size);
-            try
-            {
-                var mem = buffer.AsMemory()[..size];
-                await Connection.ReceiveAsync(mem, token).ConfigureAwait(false);
-                return DecodeResult(mem, length);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer, true);
-            }
+            return await ReadBytesFromCmdOnceAsync(cmd, length, token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            Log($"{nameof(ReadBytesFromCmdAsync)} failed: {ex.Message}");
-            return [];
+            Log($"{nameof(ReadBytesFromCmdAsync)} failed: {ex.Message}. Attempting reconnect...");
+            if (await TryReconnectAsync(token).ConfigureAwait(false))
+            {
+                try
+                {
+                    // Read/peek commands are idempotent — safe to resend after reconnect.
+                    return await ReadBytesFromCmdOnceAsync(cmd, length, token).ConfigureAwait(false);
+                }
+                catch (Exception ex2)
+                {
+                    Log($"{nameof(ReadBytesFromCmdAsync)} retry failed: {ex2.Message}.");
+                }
+            }
+            // Return a right-sized zero-filled buffer so callers that index into the result
+            // don't crash; they'll see safe "false/zero" state reads that route to recovery.
+            Log($"Returning zero-filled result for {nameof(ReadBytesFromCmdAsync)} (length={length}).");
+            return new byte[length];
         }
     }
 
@@ -104,14 +188,14 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
         {
             var result = new byte[length];
             if (buffer.Length < 1)
-                return [];
+                return new byte[length]; // callers index unconditionally; return right-sized zero-filled buffer
             var span = buffer.Span[..^1]; // Last byte is always a terminator
             Decoder.LoadHexBytesTo(span, result);
             return result;
         }
         catch (Exception)
         {
-            return [];
+            return new byte[length]; // callers index unconditionally; return right-sized zero-filled buffer
         }
     }
 

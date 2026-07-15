@@ -227,6 +227,10 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Full re-navigation each trade is slightly slower but immune to that.
         StartFromOverworld = true;
 
+        // Refresh cached session offsets each trade so stale addresses (from an odd
+        // game state at startup) don't cause IsConnectedOnline to misreport.
+        await InitializeSessionOffsets(token).ConfigureAwait(false);
+
         // StartFromOverworld can be true on first pass or if something went wrong last trade.
         if (StartFromOverworld && !await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
             await RecoverToOverworld(token).ConfigureAwait(false);
@@ -245,6 +249,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         }
         else if (StartFromOverworld && !await ConnectAndEnterPortal(token).ConfigureAwait(false))
         {
+            await RecoverToOverworld(token).ConfigureAwait(false);
+            return PokeTradeResult.RecoverStart;
+        }
+
+        if (!await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+        {
+            Log("Console is not online after portal navigation; recovering.");
             await RecoverToOverworld(token).ConfigureAwait(false);
             return PokeTradeResult.RecoverStart;
         }
@@ -497,6 +508,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             await Task.Delay(1_000, token).ConfigureAwait(false);
             ctr -= 1_000;
             var newNID = await GetTradePartnerNID(TradePartnerNIDOffset, token).ConfigureAwait(false);
+
+            if (!await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+            {
+                Log("Console went offline while searching for a partner.");
+                return false;
+            }
+
             if (newNID != 0)
             {
                 TradePartnerOfferedOffset = await SwitchConnection.PointerAll(Offsets.LinkTradePartnerPokemonPointer, token).ConfigureAwait(false);
@@ -573,6 +591,23 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         return await SetUpPortalCursor(token).ConfigureAwait(false);
     }
 
+    private async Task DismissNewsIfShowing(CancellationToken token)
+    {
+        int iterations = 0;
+        while (await SwitchConnection.IsProgramRunning(LibAppletWeID, token).ConfigureAwait(false))
+        {
+            if (iterations == 0)
+                Log("News detected, dismissing...");
+            await Task.Delay(2_000, token).ConfigureAwait(false);
+            await Click(B, 1_000, token).ConfigureAwait(false);
+            if (++iterations >= 10)
+            {
+                Log("News popup still showing after 10 dismissal attempts; giving up.");
+                break;
+            }
+        }
+    }
+
     // Should be used from the overworld. Opens X menu, attempts to connect online, and enters the Portal.
     // The cursor should be positioned over Link Trade.
     private async Task<bool> ConnectAndEnterPortal(CancellationToken token)
@@ -585,13 +620,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Open the X Menu.
         await Click(X, 1_000, token).ConfigureAwait(false);
 
-        // Handle the news popping up.
-        if (await SwitchConnection.IsProgramRunning(LibAppletWeID, token).ConfigureAwait(false))
-        {
-            Log("News detected, will close once it's loaded!");
-            await Task.Delay(5_000, token).ConfigureAwait(false);
-            await Click(B, 2_000, token).ConfigureAwait(false);
-        }
+        await DismissNewsIfShowing(token).ConfigureAwait(false);
 
         // Scroll to the bottom of the Main Menu, so we don't need to care if Picnic is unlocked.
         await Click(DRIGHT, 0_300, token).ConfigureAwait(false);
@@ -627,13 +656,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return false; // Failed, either due to connection or softban.
         }
 
-        // Handle the news popping up.
-        if (await SwitchConnection.IsProgramRunning(LibAppletWeID, token).ConfigureAwait(false))
-        {
-            Log("News detected, will close once it's loaded!");
-            await Task.Delay(5_000, token).ConfigureAwait(false);
-            await Click(B, 2_000 + Hub.Config.Timings.ExtraTimeLoadPortal, token).ConfigureAwait(false);
-        }
+        await DismissNewsIfShowing(token).ConfigureAwait(false);
 
         // Don't move the cursor unless we're actually on the Portal menu -- if a popup (e.g.
         // the news) is still covering it, bail cleanly so the trade requeues and re-navigates
