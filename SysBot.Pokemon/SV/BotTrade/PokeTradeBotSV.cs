@@ -220,6 +220,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         poke.TradeInitialize(this);
         Hub.Config.Stream.EndEnterCode(this);
 
+        // Always begin each trade from the overworld and run the full, deterministic portal
+        // navigation. The fast in-portal "reorient" path assumes the cursor is still on Link
+        // Trade, which is false whenever the Poke Portal news popup interrupts navigation --
+        // that mismatch made the bot mash the code/confirm buttons on the wrong screen.
+        // Full re-navigation each trade is slightly slower but immune to that.
+        StartFromOverworld = true;
+
         // StartFromOverworld can be true on first pass or if something went wrong last trade.
         if (StartFromOverworld && !await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
             await RecoverToOverworld(token).ConfigureAwait(false);
@@ -272,14 +279,19 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         LastTradeDistributionFixed = poke.Type == PokeTradeType.Random && !Hub.Config.Distribution.RandomCode;
 
         // Search for a trade partner for a Link Trade.
-        await Click(A, 0_500, token).ConfigureAwait(false);
-        await Click(A, 0_500, token).ConfigureAwait(false);
+        // The "Search for a trade partner?" confirmation can lag behind an online check, so give
+        // it a moment to render, then press A a few times with generous spacing to reliably hit
+        // Yes. Extra A presses once searching has begun are harmless.
+        await Task.Delay(1_500, token).ConfigureAwait(false);
+        await Click(A, 1_200, token).ConfigureAwait(false);
+        await Click(A, 1_200, token).ConfigureAwait(false);
 
         // Clear it so we can detect it loading.
         await ClearTradePartnerNID(TradePartnerNIDOffset, token).ConfigureAwait(false);
 
         // Wait for Barrier to trigger all bots simultaneously.
         WaitAtBarrierIfApplicable(token);
+        await Click(A, 1_000, token).ConfigureAwait(false);
         await Click(A, 1_000, token).ConfigureAwait(false);
 
         poke.TradeSearching(this);
@@ -623,6 +635,15 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             await Click(B, 2_000 + Hub.Config.Timings.ExtraTimeLoadPortal, token).ConfigureAwait(false);
         }
 
+        // Don't move the cursor unless we're actually on the Portal menu -- if a popup (e.g.
+        // the news) is still covering it, bail cleanly so the trade requeues and re-navigates
+        // rather than pressing buttons on the wrong screen.
+        if (!await IsInPokePortal(PortalOffset, token).ConfigureAwait(false))
+        {
+            Log("Not on the Poke Portal after connecting (popup?); aborting cursor setup.");
+            return false;
+        }
+
         Log("Adjusting the cursor in the Portal.");
         // Move down to Link Trade.
         await Click(DDOWN, 0_300, token).ConfigureAwait(false);
@@ -899,6 +920,17 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return (offered, PokeTradeResult.IllegalTrade);
         }
 
+        // DIAGNOSTIC: capture the exact offered mon so sets can be verified against the real
+        // Pokemon (level/met/encounter), not an idealized one.
+        try
+        {
+            var _buf = new byte[offered.SIZE_PARTY];
+            offered.WriteDecryptedDataParty(_buf);
+            System.IO.File.WriteAllBytes("/opt/sysbot/app/records/editreturn_offered.pk9", _buf);
+            Log($"Edit-return offered: {GetSpeciesName(offered.Species)} Lv{offered.CurrentLevel} MetLv{offered.MetLevel} Ball{offered.Ball} Egg{offered.WasEgg} Enc={la.EncounterOriginal?.GetType().Name} Moves={offered.Move1}/{offered.Move2}/{offered.Move3}/{offered.Move4} Relearn={offered.RelearnMove1}/{offered.RelearnMove2}/{offered.RelearnMove3}/{offered.RelearnMove4}");
+        }
+        catch (Exception ex) { Log($"Edit-return offered dump failed: {ex.Message}"); }
+
         // Build the edited mon on a clone of the offered mon
         var edited = offered.Clone();
 
@@ -919,7 +951,18 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         edited.TeraTypeOverride = target.TeraTypeOverride;
 
+        // Raise the level to the set's level so the requested moves are legal: a low-level offered
+        // mon can't legally know moves learned above its current level (the Move Reminder only
+        // re-teaches up to the current level). Met level is unchanged -- training a mon up is always
+        // legal -- and we never drop below met level.
+        edited.CurrentLevel = (byte)System.Math.Max(target.CurrentLevel, offered.MetLevel);
+
         edited.SetMoves(new ushort[] { target.Move1, target.Move2, target.Move3, target.Move4 }, true);
+
+        // Gen 9 mons carry per-TM record flags (which TMs were ever used on them -- the Move
+        // Reminder reads these). A TM move without its flag is judged Unobtainable, so flag the
+        // requested moves; level-up and egg moves ignore the flags.
+        edited.SetRecordFlags(new ushort[] { target.Move1, target.Move2, target.Move3, target.Move4 });
         var laRelearn = new LegalityAnalysis(edited);
         Span<ushort> relearn = stackalloc ushort[4];
         laRelearn.GetSuggestedRelearnMoves(relearn);
@@ -931,6 +974,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         var laEdit = new LegalityAnalysis(edited);
         if (!laEdit.Valid)
         {
+            Log($"Edit-return pre-repair legality for {poke.Trainer.TrainerName}:\n{laEdit.Report()}");
             edited = (PK9)edited.LegalizePokemon();
             edited.RefreshChecksum();
             laEdit = new LegalityAnalysis(edited);
@@ -957,7 +1001,20 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             edited.Ball != offered.Ball ||
             ((IHomeTrack)edited).Tracker != ((IHomeTrack)offered).Tracker)
         {
-            Log($"Edit-return provenance guard triggered for {poke.Trainer.TrainerName}.");
+            var drift = new System.Collections.Generic.List<string>();
+            if (edited.EncryptionConstant != offered.EncryptionConstant) drift.Add("EncryptionConstant");
+            if (edited.PID != offered.PID) drift.Add("PID");
+            if (edited.ID32 != offered.ID32) drift.Add("ID32");
+            if (edited.OriginalTrainerName != offered.OriginalTrainerName) drift.Add("OT");
+            if (edited.OriginalTrainerGender != offered.OriginalTrainerGender) drift.Add("OTGender");
+            if (edited.Version != offered.Version) drift.Add("Version");
+            if (edited.Language != offered.Language) drift.Add("Language");
+            if (edited.MetLocation != offered.MetLocation) drift.Add("MetLocation");
+            if (edited.MetLevel != offered.MetLevel) drift.Add("MetLevel");
+            if (edited.EggLocation != offered.EggLocation) drift.Add("EggLocation");
+            if (edited.Ball != offered.Ball) drift.Add("Ball");
+            if (((IHomeTrack)edited).Tracker != ((IHomeTrack)offered).Tracker) drift.Add("Tracker");
+            Log($"Edit-return provenance guard triggered for {poke.Trainer.TrainerName}. Drifted: {string.Join(", ", drift)}");
             poke.SendNotification(this, "Safety check failed — I did not alter your Pokémon.");
             return (offered, PokeTradeResult.IllegalTrade);
         }
