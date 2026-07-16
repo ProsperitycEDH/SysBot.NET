@@ -1060,7 +1060,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         edited.StatNature = target.StatNature;
 
-        edited.TeraTypeOverride = target.TeraTypeOverride;
+        // Tera is provenance, not competitive layer: Champions has no tera mechanic, and
+        // HOME-transferred mons have a fixed expected tera that an overwrite breaks.
 
         // Raise the level to the set's level so the requested moves are legal: a low-level offered
         // mon can't legally know moves learned above its current level (the Move Reminder only
