@@ -137,10 +137,11 @@ public abstract class PokeRoutineExecutor9SV(PokeBotState Config) : PokeRoutineE
     protected virtual async Task EnterLinkCode(int code, PokeTradeHubConfig config, CancellationToken token)
     {
         // Default implementation to just press directional arrows. Can do via Hid keys, but users are slower than bots at even the default code entry.
+        // SV code entry needs at least 75 ms between presses to register reliably on all consoles.
         var keys = TradeUtil.GetPresses(code);
         foreach (var key in keys)
         {
-            int delay = config.Timings.KeypressTime;
+            int delay = Math.Max(config.Timings.KeypressTime, 75);
             await Click(key, delay, token).ConfigureAwait(false);
         }
         // Confirm Code outside of this method (allow synchronization)
@@ -263,5 +264,25 @@ public abstract class PokeRoutineExecutor9SV(PokeBotState Config) : PokeRoutineE
     {
         var data = await SwitchConnection.PointerPeek(1, Offsets.ConfigPointer, token).ConfigureAwait(false);
         return (TextSpeedOption)(data[0] & 3);
+    }
+
+    /// <summary>
+    /// Reads a single byte at an absolute offset 3 times with 250 ms spacing.
+    /// Returns <c>true</c> only when all three consecutive samples equal <paramref name="expected"/>.
+    /// </summary>
+    /// <remarks>
+    /// This guards against stale state reads caused by async game state transitions.
+    /// </remarks>
+    protected async Task<bool> ConfirmStateByte(ulong offset, byte expected, CancellationToken token)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            var data = await SwitchConnection.ReadBytesAbsoluteAsync(offset, 1, token).ConfigureAwait(false);
+            if (data.Length == 0 || data[0] != expected)
+                return false;
+            if (i < 2)
+                await Task.Delay(250, token).ConfigureAwait(false);
+        }
+        return true;
     }
 }

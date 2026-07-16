@@ -22,6 +22,22 @@ public class CommandTests
         var expect = "click X\r\n"u8;
         expect.SequenceEqual(poke).Should().BeTrue();
     }
+
+    [Fact]
+    public void PixelPeekCommandWithCrlf()
+    {
+        var cmd = SwitchCommand.PixelPeek(crlf: true);
+        var expect = "pixelPeek\r\n"u8;
+        expect.SequenceEqual(cmd).Should().BeTrue();
+    }
+
+    [Fact]
+    public void PixelPeekCommandWithoutCrlf()
+    {
+        var cmd = SwitchCommand.PixelPeek(crlf: false);
+        var expect = "pixelPeek"u8;
+        expect.SequenceEqual(cmd).Should().BeTrue();
+    }
 }
 
 public class DecodeTests

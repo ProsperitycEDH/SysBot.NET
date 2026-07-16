@@ -423,6 +423,119 @@ public sealed class SwitchSocketAsync : SwitchSocket, ISwitchConnectionAsync
         }
     }
 
+    /// <summary>
+    /// Maximum ASCII-hex payload to accept for pixelPeek (8 MiB).
+    /// </summary>
+    private const int PixelPeekMaxAsciiBytes = 8 * 1024 * 1024;
+
+    /// <summary>
+    /// Captures a screenshot from the console. Returns decoded JPEG bytes.
+    /// Best-effort: returns empty array on any failure except caller cancellation.
+    /// </summary>
+    public async Task<byte[]> PixelPeek(CancellationToken token)
+    {
+        try
+        {
+            return await PixelPeekOnceAsync(token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log($"{nameof(PixelPeek)} failed: {ex.Message}. Attempting reconnect...");
+            if (await TryReconnectAsync(token).ConfigureAwait(false))
+            {
+                try
+                {
+                    return await PixelPeekOnceAsync(token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex2)
+                {
+                    Log($"{nameof(PixelPeek)} retry failed: {ex2.Message}");
+                }
+            }
+            return Array.Empty<byte>();
+        }
+        catch (OperationCanceledException ex)
+        {
+            if (token.IsCancellationRequested)
+            {
+                // True caller cancellation — propagate.
+                throw;
+            }
+            // Internal deadline expired (best-effort failure). Log and return empty.
+            Log($"{nameof(PixelPeek)} internal deadline expired: {ex.Message}");
+            return Array.Empty<byte>();
+        }
+    }
+
+    private async Task<byte[]> PixelPeekOnceAsync(CancellationToken token)
+    {
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(15_000);
+
+        var cmd = SwitchCommand.PixelPeek();
+        await Connection.SendAsync(cmd, deadline.Token).ConfigureAwait(false);
+
+        // pixelPeek returns a large ASCII-hex string terminated by '\n'.
+        // Read it in chunks, handling fragmentation.
+        var hexBuffer = new System.Text.StringBuilder();
+        var readBuf = new byte[4096];
+        int totalAsciiBytes = 0;
+
+        while (true)
+        {
+            deadline.Token.ThrowIfCancellationRequested();
+            int received = await Connection.ReceiveAsync(readBuf, deadline.Token).ConfigureAwait(false);
+            if (received == 0)
+                throw new SocketException(); // peer closed
+
+            totalAsciiBytes += received;
+            if (totalAsciiBytes > PixelPeekMaxAsciiBytes)
+            {
+                Log($"{nameof(PixelPeek)}: response exceeded {PixelPeekMaxAsciiBytes} bytes, aborting.");
+                return Array.Empty<byte>();
+            }
+
+            // ASCII hex — decode the chunk directly.
+            var chunk = readBuf.AsSpan(0, received);
+            int ni = Array.IndexOf(readBuf, (byte)'\n', 0, received);
+            if (ni >= 0)
+            {
+                // Found the newline terminator. Include everything before it.
+                hexBuffer.Append(Encoding.ASCII.GetString(readBuf, 0, ni));
+                break;
+            }
+            hexBuffer.Append(Encoding.ASCII.GetString(chunk));
+        }
+
+        string hex = hexBuffer.ToString().Trim();
+        if (string.IsNullOrEmpty(hex))
+        {
+            Log($"{nameof(PixelPeek)}: empty response.");
+            return Array.Empty<byte>();
+        }
+
+        // Validate even length.
+        if (hex.Length % 2 != 0)
+        {
+            Log($"{nameof(PixelPeek)}: malformed hex response (odd length: {hex.Length}).");
+            return Array.Empty<byte>();
+        }
+
+        try
+        {
+            return Decoder.ConvertHexByteStringToBytes(Encoding.ASCII.GetBytes(hex));
+        }
+        catch (Exception ex)
+        {
+            Log($"{nameof(PixelPeek)}: hex decode failed: {ex.Message}");
+            return Array.Empty<byte>();
+        }
+    }
+
     public Task<byte[]> PointerPeek(int size, IEnumerable<long> jumps, CancellationToken token)
     {
         return ReadBytesFromCmdAsync(SwitchCommand.PointerPeek(jumps, size), size, token);

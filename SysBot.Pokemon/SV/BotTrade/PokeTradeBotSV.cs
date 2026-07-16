@@ -2,6 +2,7 @@ using PKHeX.Core;
 using PKHeX.Core.Searching;
 using SysBot.Base;
 using System;
+using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Threading;
@@ -243,13 +244,16 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         // StartFromOverworld can be true on first pass or if something went wrong last trade.
         if (StartFromOverworld && !await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
+        {
             await RecoverToOverworld(token).ConfigureAwait(false);
+        }
 
         // Handles getting into the portal. Will retry this until successful.
         // if we're not starting from overworld, then ensure we're online before opening link trade -- will break the bot otherwise.
         // If we're starting from overworld, then ensure we're online before opening the portal.
-        if (!StartFromOverworld && !await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+        if (!StartFromOverworld && !await RefreshAndConfirmOnlineState(token).ConfigureAwait(false))
         {
+            await CaptureNavigationFailureAsync("not-online", token).ConfigureAwait(false);
             await RecoverToOverworld(token).ConfigureAwait(false);
             if (!await ConnectAndEnterPortal(token).ConfigureAwait(false))
             {
@@ -263,9 +267,11 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return PokeTradeResult.RecoverStart;
         }
 
-        if (!await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+        // Post-navigation online gate: confirm online with stable fresh check.
+        if (!await RefreshAndConfirmOnlineState(token).ConfigureAwait(false))
         {
             Log("Console is not online after portal navigation; recovering.");
+            await CaptureNavigationFailureAsync("post-nav-not-online", token).ConfigureAwait(false);
             await RecoverToOverworld(token).ConfigureAwait(false);
             return PokeTradeResult.RecoverStart;
         }
@@ -300,9 +306,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         LastTradeDistributionFixed = poke.Type == PokeTradeType.Random && !Hub.Config.Distribution.RandomCode;
 
         // Search for a trade partner for a Link Trade.
-        // The "Search for a trade partner?" confirmation can lag behind an online check, so give
-        // it a moment to render, then press A a few times with generous spacing to reliably hit
-        // Yes. Extra A presses once searching has begun are harmless.
+        // NOTE: There is no proven memory signal for the code-entry or search-dialog state,
+        // so we cannot validate exact cursor position. The post-code confirmation A presses
+        // are hardware-proven and remain in place. Navigation failure captures (CaptureNavigationFailureAsync)
+        // are intended to supply evidence for future pointer/visual gating of these states.
+        // The confirmation can lag behind an online check, so give it a moment to render,
+        // then press A a few times with generous spacing to reliably hit Yes.
+        // Extra A presses once searching has begun are harmless.
         await Task.Delay(1_500, token).ConfigureAwait(false);
         await Click(A, 1_200, token).ConfigureAwait(false);
         await Click(A, 1_200, token).ConfigureAwait(false);
@@ -329,11 +339,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         }
         if (!partnerFound)
         {
-            if (!await RecoverToPortal(token).ConfigureAwait(false))
-            {
-                Log("Failed to recover to portal.");
-                await RecoverToOverworld(token).ConfigureAwait(false);
-            }
+            // Recover directly to overworld — consistent with every next trade starting from overworld.
+            await RecoverToOverworld(token).ConfigureAwait(false);
             return PokeTradeResult.NoTrainerFound;
         }
 
@@ -345,7 +352,10 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             await Task.Delay(0_500, token).ConfigureAwait(false);
             if (++cnt > 20) // Didn't make it in after 10 seconds.
+            {
+                await CaptureNavigationFailureAsync("box-entry-failed", token).ConfigureAwait(false);
                 return await RecoverOpenBox(token).ConfigureAwait(false);
+            }
         }
         await Task.Delay(3_000 + Hub.Config.Timings.ExtraTimeOpenBox, token).ConfigureAwait(false);
 
@@ -450,11 +460,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
     private async Task<PokeTradeResult> RecoverOpenBox(CancellationToken token)
     {
+        // Recover directly to overworld rather than re-entering Portal.
         await Click(A, 1_000, token).ConfigureAwait(false); // Ensures we dismiss a popup.
-        if (await RecoverToPortal(token).ConfigureAwait(false))
-            return PokeTradeResult.RecoverOpenBox;
-
-        Log("Failed to recover to portal.");
         await RecoverToOverworld(token).ConfigureAwait(false);
         return PokeTradeResult.RecoverOpenBox;
     }
@@ -508,15 +515,20 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     }
 
     // Upon connecting, their Nintendo ID will instantly update.
+    // Uses elapsed real time against TradeWaitTime seconds so the configured value is
+    // approximately the real wait duration (no hidden uncounted delays).
     protected virtual async Task<bool> WaitForTradePartner(CancellationToken token)
     {
         Log("Waiting for trainer...");
-        int ctr = (Hub.Config.Trade.TradeWaitTime * 1_000) - 2_000;
-        await Task.Delay(2_000, token).ConfigureAwait(false);
-        while (ctr > 0)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int waitMs = Hub.Config.Trade.TradeWaitTime * 1_000;
+        // Poll about once per second with no extra uncounted delay.
+        while (sw.ElapsedMilliseconds < waitMs)
         {
             await Task.Delay(1_000, token).ConfigureAwait(false);
-            ctr -= 1_000;
+            if (token.IsCancellationRequested)
+                return false;
+
             var newNID = await GetTradePartnerNID(TradePartnerNIDOffset, token).ConfigureAwait(false);
 
             if (!await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
@@ -530,26 +542,25 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
                 TradePartnerOfferedOffset = await SwitchConnection.PointerAll(Offsets.LinkTradePartnerPokemonPointer, token).ConfigureAwait(false);
                 return true;
             }
-
-            // Fully load into the box.
-            await Task.Delay(1_000, token).ConfigureAwait(false);
         }
         return false;
     }
 
     // If we can't manually recover to overworld, reset the game.
     // Try to avoid pressing A which can put us back in the portal with the long load time.
+    // Limited to at most 5 bounded cycles (10 B presses + box handling) before restarting.
     private async Task<bool> RecoverToOverworld(CancellationToken token)
     {
         if (await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
             return true;
 
         Log("Attempting to recover to overworld.");
-        var attempts = 0;
+        int cycles = 0;
+        const int maxCycles = 5;
         while (!await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
         {
-            attempts++;
-            if (attempts >= 30)
+            cycles++;
+            if (cycles > maxCycles)
                 break;
 
             await Click(B, 1_000, token).ConfigureAwait(false);
@@ -564,10 +575,11 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
                 await Click(A, 1_000, token).ConfigureAwait(false);
         }
 
-        // We didn't make it for some reason.
+        // We didn't make it for some reason — restart the game.
         if (!await IsOnOverworld(OverworldOffset, token).ConfigureAwait(false))
         {
-            Log("Failed to recover to overworld, rebooting the game.");
+            await CaptureNavigationFailureAsync("overworld-recovery-failed", token).ConfigureAwait(false);
+            Log("Failed to recover to overworld in 5 cycles, rebooting the game.");
             await RestartGameSV(token).ConfigureAwait(false);
         }
         await Task.Delay(1_000, token).ConfigureAwait(false);
@@ -576,29 +588,6 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         StartFromOverworld = true;
         LastTradeDistributionFixed = false;
         return true;
-    }
-
-    // If we didn't find a trainer, we're still in the portal but there can be 
-    // different numbers of pop-ups we have to dismiss to get back to when we can trade.
-    // Rather than resetting to overworld, try to reset out of portal and immediately go back in.
-    private async Task<bool> RecoverToPortal(CancellationToken token)
-    {
-        Log("Reorienting to Poké Portal.");
-        var attempts = 0;
-        while (await IsInPokePortal(PortalOffset, token).ConfigureAwait(false))
-        {
-            await Click(B, 2_500, token).ConfigureAwait(false);
-            if (++attempts >= 30)
-            {
-                Log("Failed to recover to Poké Portal.");
-                return false;
-            }
-        }
-
-        // Should be in the X menu hovered over Poké Portal.
-        await Click(A, 1_000, token).ConfigureAwait(false);
-
-        return await SetUpPortalCursor(token).ConfigureAwait(false);
     }
 
     private async Task DismissNewsIfShowing(CancellationToken token)
@@ -654,6 +643,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (++attempts > 20)
             {
                 Log("Failed to load the Poké Portal.");
+                await CaptureNavigationFailureAsync("portal-load-failed", token).ConfigureAwait(false);
                 return false;
             }
         }
@@ -663,17 +653,17 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         if (!await ConnectToOnline(Hub.Config, token).ConfigureAwait(false))
         {
             Log("Failed to connect to online.");
+            await CaptureNavigationFailureAsync("online-connect-failed", token).ConfigureAwait(false);
             return false; // Failed, either due to connection or softban.
         }
 
         await DismissNewsIfShowing(token).ConfigureAwait(false);
 
-        // Don't move the cursor unless we're actually on the Portal menu -- if a popup (e.g.
-        // the news) is still covering it, bail cleanly so the trade requeues and re-navigates
-        // rather than pressing buttons on the wrong screen.
-        if (!await IsInPokePortal(PortalOffset, token).ConfigureAwait(false))
+        // Stable portal-ready check before moving the cursor toward Link Trade.
+        if (!await ConfirmPortalReady(token).ConfigureAwait(false))
         {
-            Log("Not on the Poke Portal after connecting (popup?); aborting cursor setup.");
+            Log("Portal not stable after popup handling; aborting cursor setup.");
+            await CaptureNavigationFailureAsync("portal-not-ready", token).ConfigureAwait(false);
             return false;
         }
 
@@ -687,23 +677,32 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     // Connects online if not already. Assumes the user to be in the X menu to avoid a news screen.
     private async Task<bool> ConnectToOnline(PokeTradeHubConfig config, CancellationToken token)
     {
-        if (await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+        if (await RefreshAndConfirmOnlineState(token).ConfigureAwait(false))
             return true;
 
         await Click(L, 1_000, token).ConfigureAwait(false);
         await Click(A, 4_000, token).ConfigureAwait(false);
 
-        var wait = 0;
-        while (!await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+        // Real 15-second elapsed deadline.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 15_000)
         {
-            await Task.Delay(0_500, token).ConfigureAwait(false);
-            if (++wait > 30) // More than 15 seconds without a connection.
-                return false;
+            await Task.Delay(500, token).ConfigureAwait(false);
+            if (await IsConnectedOnline(ConnectedOffset, token).ConfigureAwait(false))
+                break;
         }
 
         // There are several seconds after connection is established before we can dismiss the menu.
         await Task.Delay(3_000 + config.Timings.ExtraTimeConnectOnline, token).ConfigureAwait(false);
         await Click(A, 1_000, token).ConfigureAwait(false);
+
+        // Do not return success until fresh stable helper confirms.
+        if (!await RefreshAndConfirmOnlineState(token).ConfigureAwait(false))
+        {
+            Log("Online not stable after connect sequence.");
+            return false;
+        }
+
         return true;
     }
 
@@ -743,13 +742,12 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
                 break;
             }
 
-            // Didn't make it out of the box for some reason.
+            // Didn't make it out of the box for some reason — prefer overworld recovery.
             if (++attempts > 20)
             {
-                Log("Failed to exit box, rebooting the game.");
-                if (!await RecoverToOverworld(token).ConfigureAwait(false))
-                    await RestartGameSV(token).ConfigureAwait(false);
-                await ConnectAndEnterPortal(token).ConfigureAwait(false);
+                Log("Failed to exit box, recovering to overworld.");
+                await CaptureNavigationFailureAsync("box-exit-failed", token).ConfigureAwait(false);
+                await RecoverToOverworld(token).ConfigureAwait(false);
                 return;
             }
         }
@@ -763,13 +761,12 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (await IsInPokePortal(PortalOffset, token).ConfigureAwait(false))
                 break;
 
-            // Didn't make it into the portal for some reason.
+            // Didn't make it into the portal for some reason — prefer overworld recovery.
             if (++attempts > 40)
             {
-                Log("Failed to load the portal, rebooting the game.");
-                if (!await RecoverToOverworld(token).ConfigureAwait(false))
-                    await RestartGameSV(token).ConfigureAwait(false);
-                await ConnectAndEnterPortal(token).ConfigureAwait(false);
+                Log("Failed to load the portal, recovering to overworld.");
+                await CaptureNavigationFailureAsync("portal-load-failed", token).ConfigureAwait(false);
+                await RecoverToOverworld(token).ConfigureAwait(false);
                 return;
             }
         }
@@ -784,6 +781,87 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         PortalOffset = await SwitchConnection.PointerAll(Offsets.PortalBoxStatusPointer, token).ConfigureAwait(false);
         ConnectedOffset = await SwitchConnection.PointerAll(Offsets.IsConnectedPointer, token).ConfigureAwait(false);
         TradePartnerNIDOffset = await SwitchConnection.PointerAll(Offsets.LinkTradePartnerNIDPointer, token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Re-resolves the online-connection pointer and requires three consecutive 0x01 samples.
+    /// </summary>
+    private async Task<bool> RefreshAndConfirmOnlineState(CancellationToken token)
+    {
+        ConnectedOffset = await SwitchConnection.PointerAll(Offsets.IsConnectedPointer, token).ConfigureAwait(false);
+        return await ConfirmStateByte(ConnectedOffset, 0x01, token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Requires three consecutive 0x10 samples from the portal/box offset and ensures the news
+    /// applet is not running. This proves a stable uncovered Portal state, not a cursor location.
+    /// </summary>
+    private async Task<bool> ConfirmPortalReady(CancellationToken token)
+    {
+        if (await SwitchConnection.IsProgramRunning(LibAppletWeID, token).ConfigureAwait(false))
+            return false;
+        return await ConfirmStateByte(PortalOffset, 0x10, token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Best-effort diagnostic capture: logs a snapshot line and saves a screenshot (if available)
+    /// to <c>records/navigation-failures/</c>. Never throws; catches and logs diagnostic exceptions.
+    /// </summary>
+    private async Task CaptureNavigationFailureAsync(string stage, CancellationToken token)
+    {
+        try
+        {
+            string sanitized = string.Concat(stage.Where(c => char.IsLetterOrDigit(c) || c == '-' || c == '_')).Replace("_", "-").Trim('-');
+            if (string.IsNullOrEmpty(sanitized)) sanitized = "unknown";
+
+            // Read the three state bytes (sequential best-effort reads).
+            byte overworldVal = 0, portalVal = 0, onlineVal = 0;
+            try
+            {
+                var owBytes = await SwitchConnection.ReadBytesAbsoluteAsync(OverworldOffset, 1, token).ConfigureAwait(false);
+                overworldVal = owBytes[0];
+            }
+            catch { /* best-effort */ }
+            try
+            {
+                var ptBytes = await SwitchConnection.ReadBytesAbsoluteAsync(PortalOffset, 1, token).ConfigureAwait(false);
+                portalVal = ptBytes[0];
+            }
+            catch { /* best-effort */ }
+            try
+            {
+                var onBytes = await SwitchConnection.ReadBytesAbsoluteAsync(ConnectedOffset, 1, token).ConfigureAwait(false);
+                onlineVal = onBytes[0];
+            }
+            catch { /* best-effort */ }
+
+            string baseName = $"{DateTime.UtcNow:yyyy-MM-dd_HH-mm-ss.fff}_{sanitized}";
+            string dir = Path.Combine(Environment.CurrentDirectory, "records", "navigation-failures");
+            Directory.CreateDirectory(dir);
+
+            string snapshotLine = $"stage={sanitized} overworldAddr=0x{OverworldOffset:X16} overworld=0x{overworldVal:X2} portalAddr=0x{PortalOffset:X16} portal=0x{portalVal:X2} onlineAddr=0x{ConnectedOffset:X16} online=0x{onlineVal:X2}";
+            string logPath = Path.Combine(dir, $"{baseName}.log");
+            await File.WriteAllTextAsync(logPath, snapshotLine + "\n", token).ConfigureAwait(false);
+            Log($"Navigation failure snapshot: {snapshotLine}");
+
+            // Screenshot capture.
+            byte[] image = await SwitchConnection.PixelPeek(token).ConfigureAwait(false);
+            if (image != null && image.Length > 0)
+            {
+                string imgPath = Path.Combine(dir, $"{baseName}.jpg");
+                await File.WriteAllBytesAsync(imgPath, image, token).ConfigureAwait(false);
+                Log($"Navigation failure screenshot saved: {imgPath}");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Caller cancellation — don't mask it.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log($"Navigation failure capture failed: {ex.Message}");
+        }
     }
 
     // todo: future

@@ -29,6 +29,7 @@ public interface ISwitchConnectionAsync : IConsoleConnectionAsync
 
     Task<byte[]> ReadRaw(byte[] command, int length, CancellationToken token);
     Task SendRaw(byte[] command, CancellationToken token);
+    Task<byte[]> PixelPeek(CancellationToken token);
 
     Task<byte[]> PointerPeek(int size, IEnumerable<long> jumps, CancellationToken token);
     Task PointerPoke(byte[] data, IEnumerable<long> jumps, CancellationToken token);

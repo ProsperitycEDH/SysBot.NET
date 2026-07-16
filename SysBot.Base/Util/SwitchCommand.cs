@@ -341,4 +341,12 @@ public static class SwitchCommand
     /// <returns>Encoded command bytes</returns>
     public static byte[] IsProgramRunning(ulong pid, bool crlf = true)
         => Encode($"isProgramRunning 0x{pid:x16}", crlf);
+
+    /// <summary>
+    /// Requests a screenshot from the sys-module (pixelPeek command).
+    /// </summary>
+    /// <param name="crlf">Line terminator (unused by USB protocol)</param>
+    /// <returns>Encoded command bytes</returns>
+    public static byte[] PixelPeek(bool crlf = true)
+        => Encode("pixelPeek", crlf);
 }

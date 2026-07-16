@@ -150,6 +150,42 @@ public sealed class SwitchUSBAsync(int Port) : SwitchUSB(Port), ISwitchConnectio
         return Task.Run(() => Send(command), token);
     }
 
+    /// <summary>
+    /// Captures a screenshot from the console. Returns decoded JPEG bytes.
+    /// Best-effort: returns empty array on any failure except caller cancellation.
+    /// </summary>
+    public Task<byte[]> PixelPeek(CancellationToken token)
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                Send(SwitchCommand.PixelPeek(false));
+                var raw = ReadBulkUSB();
+                if (raw.Length == 0)
+                {
+                    Log($"{nameof(PixelPeek)}: empty USB response.");
+                    return Array.Empty<byte>();
+                }
+
+                // usb-botbase returns ASCII hex.
+                string hex = Encoding.ASCII.GetString(raw).Trim();
+                if (hex.Length % 2 != 0 || hex.Length == 0)
+                {
+                    Log($"{nameof(PixelPeek)}: malformed hex response (length: {hex.Length}).");
+                    return Array.Empty<byte>();
+                }
+
+                return Decoder.ConvertHexByteStringToBytes(Encoding.ASCII.GetBytes(hex));
+            }
+            catch (Exception ex)
+            {
+                Log($"{nameof(PixelPeek)} failed: {ex.Message}");
+                return Array.Empty<byte>();
+            }
+        }, token);
+    }
+
     public Task<byte[]> PointerPeek(int size, IEnumerable<long> jumps, CancellationToken token)
     {
         return Task.Run(() =>
