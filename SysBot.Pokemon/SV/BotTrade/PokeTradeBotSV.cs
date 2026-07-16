@@ -1053,7 +1053,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         edited.EV_SPD = target.EV_SPD;
         edited.EV_SPE = target.EV_SPE;
 
-        edited.HeldItem = target.HeldItem;
+        // Held item is deliberately not copied: HOME strips items on deposit, so it can
+        // never reach Champions -- setting it only adds legality surface.
 
         edited.Ability = target.Ability;
         edited.AbilityNumber = target.AbilityNumber;
