@@ -2,6 +2,7 @@ using PKHeX.Core;
 using PKHeX.Core.Searching;
 using SysBot.Base;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -19,6 +20,9 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     public readonly TradeAbuseSettings AbuseSettings = Hub.Config.TradeAbuse;
 
     public ICountSettings Counts => TradeSettings;
+
+    private static readonly bool EditReturnDebugDump = Environment.GetEnvironmentVariable("GENBRIDGE_DEBUG_DUMP") is string v
+        && (v.Equals("1", StringComparison.OrdinalIgnoreCase) || v.Equals("true", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Folder to dump received trade data to.
@@ -185,27 +189,75 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
     private async Task PerformTrade(SAV9SV sav, PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority, CancellationToken token)
     {
-        PokeTradeResult result;
+        // Team mode: loop for consecutive trades
+        bool teamMode = detail.EditReturnTargets is { Count: > 0 };
+        int initialRemaining = detail.EditReturnTargets?.Count ?? 0;
+        int attempt = 0;
+        int cap = 2 * initialRemaining + 2;
+
+        PokeTradeResult result = PokeTradeResult.Success;
+        while (true)
+        {
+            attempt++;
+            // Set TradeData for this attempt (first = already set by enqueuer; subsequent = next target)
+            if (attempt > 1 && detail.EditReturnTargets is { Count: > 0 })
+                detail.TradeData = detail.EditReturnTargets[0];
+
+            result = await PerformOneTradeAttempt(sav, detail, type, priority, token).ConfigureAwait(false);
+
+            // Team mode: check continuation
+            if (teamMode && detail.EditReturnTargets is { Count: > 0 })
+            {
+                if (ShouldContinueEditReturnSession(detail.EditReturnTargets.Count, attempt, cap, result))
+                {
+                    continue;
+                }
+            }
+
+            // Session end — break out
+            break;
+        }
+
+        // Session-end summary for team mode
+        if (teamMode)
+        {
+            var remaining = detail.EditReturnTargets ?? [];
+            var parts = new List<string>();
+            if (detail.EditReturnDone.Count > 0)
+                parts.Add($"edited: {string.Join(", ", detail.EditReturnDone)}");
+            if (detail.EditReturnFailed.Count > 0)
+                parts.Add($"failed: {string.Join("; ", detail.EditReturnFailed)}");
+            if (remaining.Count > 0)
+                parts.Add($"not traded: {string.Join(", ", remaining.Select(t => GetSpeciesName(t.Species)))}");
+            var summary = "Team session ended — " + string.Join(", ", parts) + ".";
+            if (result == PokeTradeResult.NoTrainerFound && remaining.Count > 0)
+                summary += " Run /gen again with the remaining sets to finish.";
+            detail.SendNotification(this, summary);
+        }
+
+        if (result == PokeTradeResult.Success)
+            return;
+
+        HandleAbortedTrade(detail, type, priority, result);
+    }
+
+    private async Task<PokeTradeResult> PerformOneTradeAttempt(SAV9SV sav, PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority, CancellationToken token)
+    {
         try
         {
-            result = await PerformLinkCodeTrade(sav, detail, token).ConfigureAwait(false);
-            if (result == PokeTradeResult.Success)
-                return;
+            return await PerformLinkCodeTrade(sav, detail, token).ConfigureAwait(false);
         }
         catch (SocketException socket)
         {
             Log(socket.Message);
-            result = PokeTradeResult.ExceptionConnection;
-            HandleAbortedTrade(detail, type, priority, result);
+            HandleAbortedTrade(detail, type, priority, PokeTradeResult.ExceptionConnection);
             throw; // let this interrupt the trade loop. re-entering the trade loop will recheck the connection.
         }
         catch (Exception e)
         {
             Log(e.Message);
-            result = PokeTradeResult.ExceptionInternal;
+            return PokeTradeResult.ExceptionInternal;
         }
-
-        HandleAbortedTrade(detail, type, priority, result);
     }
 
     private void HandleAbortedTrade(PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority, PokeTradeResult result)
@@ -1010,8 +1062,25 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     private async Task<(PK9 toSend, PokeTradeResult check)> HandleEditReturn(
         SAV9SV sav, PokeTradeDetail<PK9> poke, PK9 offered, PK9 target, CancellationToken token)
     {
-        // Species/form gate
-        if (offered.Species != target.Species || offered.Form != target.Form)
+        // --- Team mode: resolve target from EditReturnTargets ---
+        var targets = poke.EditReturnTargets;
+        bool teamMode = targets is { Count: > 0 };
+        int teamIdx = -1;
+        if (teamMode)
+        {
+            teamIdx = FindTeamTargetIndex(targets!, offered.Species, offered.Form);
+            if (teamIdx < 0)
+            {
+                var remainingNames = string.Join(", ", targets!.Select(t => GetSpeciesName(t.Species)));
+                poke.SendNotification(this,
+                    $"Your {GetSpeciesName(offered.Species)} isn't in this request's remaining team. Remaining: {remainingNames}. Offer one of those.");
+                return (offered, PokeTradeResult.TrainerRequestBad);
+            }
+            target = targets![teamIdx];
+        }
+
+        // Species/form gate (skip in team mode — matching already guaranteed it)
+        if (!teamMode && (offered.Species != target.Species || offered.Form != target.Form))
         {
             poke.SendNotification(this, $"Edit-return keeps your Pokémon's species. You offered {GetSpeciesName(offered.Species)} but the set is for {GetSpeciesName(target.Species)}. Offer the matching species.");
             return (offered, PokeTradeResult.TrainerRequestBad);
@@ -1037,7 +1106,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             var _buf = new byte[offered.SIZE_PARTY];
             offered.WriteDecryptedDataParty(_buf);
-            System.IO.File.WriteAllBytes("/opt/sysbot/app/records/editreturn_offered.pk9", _buf);
+            if (EditReturnDebugDump)
+                System.IO.File.WriteAllBytes("/opt/sysbot/app/records/editreturn_offered.pk9", _buf);
             Log($"Edit-return offered: {GetSpeciesName(offered.Species)} Lv{offered.CurrentLevel} MetLv{offered.MetLevel} Ball{offered.Ball} Egg{offered.WasEgg} Enc={la.EncounterOriginal?.GetType().Name} Moves={offered.Move1}/{offered.Move2}/{offered.Move3}/{offered.Move4} Relearn={offered.RelearnMove1}/{offered.RelearnMove2}/{offered.RelearnMove3}/{offered.RelearnMove4}");
         }
         catch (Exception ex) { Log($"Edit-return offered dump failed: {ex.Message}"); }
@@ -1085,9 +1155,11 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         // Legality re-check with guarded repair fallback
         var laEdit = new LegalityAnalysis(edited);
+        string? preRepairReport = null;
         if (!laEdit.Valid)
         {
-            Log($"Edit-return pre-repair legality for {poke.Trainer.TrainerName}:\n{laEdit.Report()}");
+            preRepairReport = laEdit.Report();
+            Log($"Edit-return pre-repair legality for {poke.Trainer.TrainerName}:\n{preRepairReport}");
             edited = (PK9)edited.LegalizePokemon();
             edited.RefreshChecksum();
             laEdit = new LegalityAnalysis(edited);
@@ -1096,7 +1168,15 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             Log(laEdit.Report());
             poke.SendNotification(this, "I couldn't make that set legal for your Pokémon (a move or ability may not be obtainable). Exiting trade.");
-            poke.SendNotification(this, laEdit.Report());
+            poke.SendNotification(this, CondenseLegalityReport(laEdit.Report()));
+
+            // Team-mode bookkeeping: remove this set, mark failed
+            if (teamMode)
+            {
+                targets!.RemoveAt(teamIdx);
+                poke.EditReturnFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
+            }
+
             return (offered, PokeTradeResult.IllegalTrade);
         }
 
@@ -1114,7 +1194,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             edited.Ball != offered.Ball ||
             ((IHomeTrack)edited).Tracker != ((IHomeTrack)offered).Tracker)
         {
-            var drift = new System.Collections.Generic.List<string>();
+            var drift = new List<string>();
             if (edited.EncryptionConstant != offered.EncryptionConstant) drift.Add("EncryptionConstant");
             if (edited.PID != offered.PID) drift.Add("PID");
             if (edited.ID32 != offered.ID32) drift.Add("ID32");
@@ -1128,13 +1208,38 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (edited.Ball != offered.Ball) drift.Add("Ball");
             if (((IHomeTrack)edited).Tracker != ((IHomeTrack)offered).Tracker) drift.Add("Tracker");
             Log($"Edit-return provenance guard triggered for {poke.Trainer.TrainerName}. Drifted: {string.Join(", ", drift)}");
-            poke.SendNotification(this, "Safety check failed — I did not alter your Pokémon.");
+
+            // Team-mode bookkeeping: remove this set, mark failed
+            if (teamMode)
+            {
+                targets!.RemoveAt(teamIdx);
+                poke.EditReturnFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
+            }
+
+            if (preRepairReport != null)
+            {
+                poke.SendNotification(this,
+                    $"That set isn't legal for the Pokémon you offered — its level, origin, or moves don't allow it, so I didn't alter it. PKHeX says:\n{CondenseLegalityReport(preRepairReport)}");
+            }
+            else
+            {
+                poke.SendNotification(this,
+                    "Safety check failed — I did not alter your Pokémon. This looks like a bot problem, not your set; tell the commissioner.");
+            }
+
             return (offered, PokeTradeResult.IllegalTrade);
         }
 
         // Success: inject the edited mon and return
         poke.SendNotification(this, $"**Editing your {GetSpeciesName(edited.Species)}** with the requested set — trading it back now.");
         Log($"Edit-return: applied set to {GetSpeciesName(edited.Species)} for {poke.Trainer.TrainerName}.");
+
+        // Team-mode bookkeeping: mark done, remove from targets
+        if (teamMode)
+        {
+            targets!.RemoveAt(teamIdx);
+            poke.EditReturnDone.Add(GetSpeciesName(target.Species));
+        }
 
         await Click(A, 0_800, token).ConfigureAwait(false);
         await SetBoxPokemonAbsolute(BoxStartOffset, edited, token, sav).ConfigureAwait(false);
@@ -1222,5 +1327,44 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             Hub.BotSync.Barrier.RemoveParticipant();
             Log($"Left the Barrier. Count: {Hub.BotSync.Barrier.ParticipantCount}");
         }
+    }
+
+    /// <summary>
+    /// Find first index in targets matching species+form. Returns -1 if not found.
+    /// </summary>
+    public static int FindTeamTargetIndex(IReadOnlyList<PK9> targets, ushort species, byte form)
+    {
+        for (int i = 0; i < targets.Count; i++)
+            if (targets[i].Species == species && targets[i].Form == form)
+                return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// Condense a PKHeX legality report: keep lines containing "Invalid" (case-sensitive),
+    /// or first 3 lines if none match. Truncate to 900 chars.
+    /// </summary>
+    private static string CondenseLegalityReport(string report)
+    {
+        var lines = report.Split('\n');
+        var invalidLines = lines.Where(l => l.Contains("Invalid")).ToList();
+        var selected = invalidLines.Count > 0 ? invalidLines : lines.Take(3).ToList();
+        var result = string.Join("\n", selected);
+        return result.Length > 900 ? result.Substring(0, 900) : result;
+    }
+
+    /// <summary>
+    /// Determine whether to continue a team edit-return session.
+    /// Continues on Success, IllegalTrade, TrainerRequestBad, TrainerTooSlow with remaining > 0 and attempts < cap.
+    /// Stops on remaining == 0, attempts >= cap, or non-continuable results (NoTrainerFound, RecoverStart, etc.).
+    /// </summary>
+    public static bool ShouldContinueEditReturnSession(int remaining, int attempts, int cap, PokeTradeResult result)
+    {
+        if (remaining <= 0) return false;
+        if (attempts >= cap) return false;
+        return result is PokeTradeResult.Success
+            or PokeTradeResult.IllegalTrade
+            or PokeTradeResult.TrainerRequestBad
+            or PokeTradeResult.TrainerTooSlow;
     }
 }

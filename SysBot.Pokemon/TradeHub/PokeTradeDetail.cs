@@ -1,5 +1,6 @@
 ﻿using PKHeX.Core;
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace SysBot.Pokemon;
@@ -55,6 +56,15 @@ public class PokeTradeDetail<TPoke>(TPoke TradeData, PokeTradeTrainerInfo Traine
     public void SendNotification(PokeRoutineExecutor<TPoke> routine, string message) => Notifier.SendNotification(routine, this, message);
     public void SendNotification(PokeRoutineExecutor<TPoke> routine, PokeTradeSummary obj) => Notifier.SendNotification(routine, this, obj);
     public void SendNotification(PokeRoutineExecutor<TPoke> routine, TPoke obj, string message) => Notifier.SendNotification(routine, this, obj, message);
+
+    /// <summary>Remaining unconsumed team sets for multi-set edit-return; null means single-mon mode.</summary>
+    public List<TPoke>? EditReturnTargets;
+
+    /// <summary>Species names successfully edited+traded in a team session.</summary>
+    public List<string> EditReturnDone = [];
+
+    /// <summary>Entries "Species — reason" for sets dropped as illegal in a team session.</summary>
+    public List<string> EditReturnFailed = [];
 
     public bool Equals(PokeTradeDetail<TPoke>? other)
     {
