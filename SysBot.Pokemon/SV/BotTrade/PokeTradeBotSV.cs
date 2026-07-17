@@ -293,16 +293,17 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         var toSend = poke.TradeData;
 
+        if (continueInBox && !await IsInBox(PortalOffset, token).ConfigureAwait(false))
+        {
+            Log("Team trade session was no longer in the box; reconnecting with the same code.");
+            await RecoverToOverworld(token).ConfigureAwait(false);
+            continueInBox = false;
+        }
+
         if (continueInBox)
         {
             // A successful SV trade leaves both players in the same trade box. Team edit-return
             // reuses that live partner session instead of backing out and searching by code again.
-            if (!await IsInBox(PortalOffset, token).ConfigureAwait(false))
-            {
-                Log("Team trade session was no longer in the box; falling back to recovery.");
-                return await RecoverOpenBox(token).ConfigureAwait(false);
-            }
-
             Log("Continuing team edit-return with the existing Link Trade partner.");
             if (toSend.Species != 0)
                 await SetBoxPokemonAbsolute(BoxStartOffset, toSend, token, sav).ConfigureAwait(false);
@@ -529,8 +530,16 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Log for Trade Abuse tracking.
         LogSuccessfulTrades(poke, trainerNID, tradePartner.TrainerName);
 
+        bool boxReady = await WaitForPostTradeBox(token).ConfigureAwait(false);
+        if (!boxReady)
+        {
+            Log("Trade box did not return after the post-trade/Pokedex screen; recovering to overworld.");
+            await CaptureNavigationFailureAsync("post-trade-pokedex", token).ConfigureAwait(false);
+            await RecoverToOverworld(token).ConfigureAwait(false);
+        }
+
         int remaining = poke.EditReturnTargets?.Count ?? 0;
-        if (ShouldKeepTeamTradeBoxOpen(poke.Type, remaining, anotherAttemptAllowed, PokeTradeResult.Success))
+        if (boxReady && ShouldKeepTeamTradeBoxOpen(poke.Type, remaining, anotherAttemptAllowed, PokeTradeResult.Success))
         {
             // Compare the next attempt against the offer that just completed. If the captain
             // already selected their next Pokemon, it is immediately recognized as a change;
@@ -538,13 +547,38 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             lastOffered = oldEC;
             Log($"Keeping Link Trade session open for {remaining} remaining team trade(s).");
         }
-        else
+        else if (boxReady)
         {
             // Sometimes they offered another mon, so store that immediately upon leaving Union Room.
             lastOffered = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
             await ExitTradeToPortal(false, token).ConfigureAwait(false);
         }
+        else
+        {
+            StartFromOverworld = true;
+            LastTradeDistributionFixed = false;
+        }
         return PokeTradeResult.Success;
+    }
+
+    /// <summary>
+    /// Waits for SV to return to the Link Trade box after a completed trade. A newly received
+    /// species can insert a Pokedex registration screen here, so advance bounded overlays with A.
+    /// </summary>
+    private async Task<bool> WaitForPostTradeBox(CancellationToken token)
+    {
+        const int maxAttempts = 20;
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            if (await IsInBox(PortalOffset, token).ConfigureAwait(false))
+                return true;
+
+            if (attempt == 0)
+                Log("Waiting for post-trade screens to return to the trade box.");
+            await Click(A, 1_500, token).ConfigureAwait(false);
+        }
+
+        return await IsInBox(PortalOffset, token).ConfigureAwait(false);
     }
 
     private async Task<PokeTradeResult> RecoverOpenBox(CancellationToken token)
@@ -1152,6 +1186,24 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Build the edited mon on a clone of the offered mon
         var edited = offered.Clone();
 
+        // Randomize gender when this specific Pokemon can legally change it without identity
+        // drift. Genderless/single-gender species and encounter-fixed gifts remain constrained;
+        // transferred Pokemon whose gender is tied to PID keep their original gender.
+        var genderCandidate = offered.Clone();
+        genderCandidate.Gender = SelectRandomizedGender(
+            genderCandidate, la.EncounterOriginal as IFixedGender, Random.Shared.Next(2) == 1);
+        genderCandidate.RefreshChecksum();
+        if (genderCandidate.PID == offered.PID &&
+            genderCandidate.EncryptionConstant == offered.EncryptionConstant &&
+            new LegalityAnalysis(genderCandidate).Valid)
+        {
+            edited.Gender = genderCandidate.Gender;
+        }
+        else
+        {
+            Log($"Edit-return: kept original gender for {GetSpeciesName(offered.Species)} because changing it would break encounter/provenance legality.");
+        }
+
         // Copy only the competitive layer from target
         edited.EV_HP = target.EV_HP;
         edited.EV_ATK = target.EV_ATK;
@@ -1375,6 +1427,22 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (targets[i].Species == species && targets[i].Form == form)
                 return i;
         return -1;
+    }
+
+    /// <summary>
+    /// Selects a species- and encounter-valid gender. The caller separately verifies that the
+    /// choice is legal for the Pokemon's full provenance before applying it.
+    /// </summary>
+    public static byte SelectRandomizedGender(PK9 pokemon, IFixedGender? encounterGender, bool chooseFemale)
+    {
+        if (encounterGender is { IsFixedGender: true })
+            return encounterGender.Gender;
+
+        var personal = PersonalTable.SV.GetFormEntry(pokemon.Species, pokemon.Form);
+        if (!personal.IsDualGender)
+            return personal.FixedGender();
+
+        return chooseFemale ? (byte)1 : (byte)0;
     }
 
     /// <summary>

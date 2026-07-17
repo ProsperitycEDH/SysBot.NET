@@ -9,6 +9,12 @@ namespace SysBot.Tests;
 
 public class EditReturnTests
 {
+    private sealed class FixedEncounterGender(byte gender) : IFixedGender
+    {
+        public byte Gender { get; } = gender;
+        public bool IsFixedGender => true;
+    }
+
     #region SplitTeamPaste
 
     [Fact]
@@ -120,6 +126,66 @@ public class EditReturnTests
     {
         PokeTradeBotSV.ShouldContinueEditReturnSession(remaining: 2, attempts: 1, cap: 8, PokeTradeResult.RecoverStart)
             .Should().BeFalse();
+    }
+
+    #endregion
+
+    #region SelectRandomizedGender
+
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 1)]
+    public void SelectRandomizedGender_DualGenderSpecies_UsesCoinFlip(bool chooseFemale, byte expected)
+    {
+        var pokemon = new PK9 { Species = (ushort)Species.Ralts, Form = 0 };
+
+        PokeTradeBotSV.SelectRandomizedGender(pokemon, null, chooseFemale)
+            .Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SelectRandomizedGender_GenderlessSpecies_StaysGenderless(bool chooseFemale)
+    {
+        var pokemon = new PK9 { Species = (ushort)Species.Magnemite, Form = 0 };
+
+        PokeTradeBotSV.SelectRandomizedGender(pokemon, null, chooseFemale)
+            .Should().Be(EntityGender.Genderless);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SelectRandomizedGender_MaleOnlySpecies_StaysMale(bool chooseFemale)
+    {
+        var pokemon = new PK9 { Species = (ushort)Species.Tauros, Form = 0 };
+
+        PokeTradeBotSV.SelectRandomizedGender(pokemon, null, chooseFemale)
+            .Should().Be(0);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SelectRandomizedGender_FemaleOnlySpecies_StaysFemale(bool chooseFemale)
+    {
+        var pokemon = new PK9 { Species = (ushort)Species.Happiny, Form = 0 };
+
+        PokeTradeBotSV.SelectRandomizedGender(pokemon, null, chooseFemale)
+            .Should().Be(1);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SelectRandomizedGender_FixedEncounter_OverridesCoinFlip(bool chooseFemale)
+    {
+        var pokemon = new PK9 { Species = (ushort)Species.Ralts, Form = 0 };
+        var fixedFemale = new FixedEncounterGender(1);
+
+        PokeTradeBotSV.SelectRandomizedGender(pokemon, fixedFemale, chooseFemale)
+            .Should().Be(1);
     }
 
     #endregion
