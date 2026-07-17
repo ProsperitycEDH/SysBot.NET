@@ -124,6 +124,50 @@ public class EditReturnTests
 
     #endregion
 
+    #region ShouldKeepTeamTradeBoxOpen
+
+    [Fact]
+    public void ShouldKeepTeamTradeBoxOpen_IntermediateEditReturnSuccess_StaysOpen()
+    {
+        PokeTradeBotSV.ShouldKeepTeamTradeBoxOpen(
+            PokeTradeType.EditReturn, remaining: 2, anotherAttemptAllowed: true, PokeTradeResult.Success)
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldKeepTeamTradeBoxOpen_NoRemainingTargets_Exits()
+    {
+        PokeTradeBotSV.ShouldKeepTeamTradeBoxOpen(
+            PokeTradeType.EditReturn, remaining: 0, anotherAttemptAllowed: true, PokeTradeResult.Success)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ShouldKeepTeamTradeBoxOpen_NoAttemptRemaining_Exits()
+    {
+        PokeTradeBotSV.ShouldKeepTeamTradeBoxOpen(
+            PokeTradeType.EditReturn, remaining: 2, anotherAttemptAllowed: false, PokeTradeResult.Success)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ShouldKeepTeamTradeBoxOpen_FailedTrade_Exits()
+    {
+        PokeTradeBotSV.ShouldKeepTeamTradeBoxOpen(
+            PokeTradeType.EditReturn, remaining: 2, anotherAttemptAllowed: true, PokeTradeResult.TrainerTooSlow)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void ShouldKeepTeamTradeBoxOpen_NonEditReturn_Exits()
+    {
+        PokeTradeBotSV.ShouldKeepTeamTradeBoxOpen(
+            PokeTradeType.Specific, remaining: 2, anotherAttemptAllowed: true, PokeTradeResult.Success)
+            .Should().BeFalse();
+    }
+
+    #endregion
+
     #region FindTeamTargetIndex
 
     [Fact]

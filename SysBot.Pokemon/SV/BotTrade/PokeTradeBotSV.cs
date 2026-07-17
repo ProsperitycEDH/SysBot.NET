@@ -194,6 +194,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         int initialRemaining = detail.EditReturnTargets?.Count ?? 0;
         int attempt = 0;
         int cap = 2 * initialRemaining + 2;
+        bool continueInBox = false;
 
         PokeTradeResult result = PokeTradeResult.Success;
         while (true)
@@ -203,13 +204,16 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (attempt > 1 && detail.EditReturnTargets is { Count: > 0 })
                 detail.TradeData = detail.EditReturnTargets[0];
 
-            result = await PerformOneTradeAttempt(sav, detail, type, priority, token).ConfigureAwait(false);
+            bool anotherAttemptAllowed = attempt < cap;
+            result = await PerformOneTradeAttempt(sav, detail, type, priority, continueInBox, anotherAttemptAllowed, token).ConfigureAwait(false);
 
             // Team mode: check continuation
             if (teamMode && detail.EditReturnTargets is { Count: > 0 })
             {
                 if (ShouldContinueEditReturnSession(detail.EditReturnTargets.Count, attempt, cap, result))
                 {
+                    continueInBox = ShouldKeepTeamTradeBoxOpen(
+                        detail.Type, detail.EditReturnTargets.Count, anotherAttemptAllowed, result);
                     continue;
                 }
             }
@@ -241,11 +245,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         HandleAbortedTrade(detail, type, priority, result);
     }
 
-    private async Task<PokeTradeResult> PerformOneTradeAttempt(SAV9SV sav, PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority, CancellationToken token)
+    private async Task<PokeTradeResult> PerformOneTradeAttempt(
+        SAV9SV sav, PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority,
+        bool continueInBox, bool anotherAttemptAllowed, CancellationToken token)
     {
         try
         {
-            return await PerformLinkCodeTrade(sav, detail, token).ConfigureAwait(false);
+            return await PerformLinkCodeTrade(sav, detail, continueInBox, anotherAttemptAllowed, token).ConfigureAwait(false);
         }
         catch (SocketException socket)
         {
@@ -276,14 +282,34 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         }
     }
 
-    private async Task<PokeTradeResult> PerformLinkCodeTrade(SAV9SV sav, PokeTradeDetail<PK9> poke, CancellationToken token)
+    private async Task<PokeTradeResult> PerformLinkCodeTrade(
+        SAV9SV sav, PokeTradeDetail<PK9> poke, bool continueInBox,
+        bool anotherAttemptAllowed, CancellationToken token)
     {
         // Update Barrier Settings
         UpdateBarrier(poke.IsSynchronized);
         poke.TradeInitialize(this);
         Hub.Config.Stream.EndEnterCode(this);
 
-        // Always begin each trade from the overworld and run the full, deterministic portal
+        var toSend = poke.TradeData;
+
+        if (continueInBox)
+        {
+            // A successful SV trade leaves both players in the same trade box. Team edit-return
+            // reuses that live partner session instead of backing out and searching by code again.
+            if (!await IsInBox(PortalOffset, token).ConfigureAwait(false))
+            {
+                Log("Team trade session was no longer in the box; falling back to recovery.");
+                return await RecoverOpenBox(token).ConfigureAwait(false);
+            }
+
+            Log("Continuing team edit-return with the existing Link Trade partner.");
+            if (toSend.Species != 0)
+                await SetBoxPokemonAbsolute(BoxStartOffset, toSend, token, sav).ConfigureAwait(false);
+        }
+        else
+        {
+        // Always begin each new partner search from the overworld and run the full, deterministic portal
         // navigation. The fast in-portal "reorient" path assumes the cursor is still on Link
         // Trade, which is false whenever the Poke Portal news popup interrupts navigation --
         // that mismatch made the bot mash the code/confirm buttons on the wrong screen.
@@ -328,7 +354,6 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return PokeTradeResult.RecoverStart;
         }
 
-        var toSend = poke.TradeData;
         if (toSend.Species != 0)
             await SetBoxPokemonAbsolute(BoxStartOffset, toSend, token, sav).ConfigureAwait(false);
 
@@ -410,6 +435,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             }
         }
         await Task.Delay(3_000 + Hub.Config.Timings.ExtraTimeOpenBox, token).ConfigureAwait(false);
+        }
 
         var tradePartner = await GetTradePartnerInfo(token).ConfigureAwait(false);
         var trainerNID = await GetTradePartnerNID(TradePartnerNIDOffset, token).ConfigureAwait(false);
@@ -503,10 +529,21 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Log for Trade Abuse tracking.
         LogSuccessfulTrades(poke, trainerNID, tradePartner.TrainerName);
 
-        // Sometimes they offered another mon, so store that immediately upon leaving Union Room.
-        lastOffered = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
-
-        await ExitTradeToPortal(false, token).ConfigureAwait(false);
+        int remaining = poke.EditReturnTargets?.Count ?? 0;
+        if (ShouldKeepTeamTradeBoxOpen(poke.Type, remaining, anotherAttemptAllowed, PokeTradeResult.Success))
+        {
+            // Compare the next attempt against the offer that just completed. If the captain
+            // already selected their next Pokemon, it is immediately recognized as a change;
+            // if the offer slot clears first, ReadUntilPresent will then wait for the selection.
+            lastOffered = oldEC;
+            Log($"Keeping Link Trade session open for {remaining} remaining team trade(s).");
+        }
+        else
+        {
+            // Sometimes they offered another mon, so store that immediately upon leaving Union Room.
+            lastOffered = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
+            await ExitTradeToPortal(false, token).ConfigureAwait(false);
+        }
         return PokeTradeResult.Success;
     }
 
@@ -1366,5 +1403,18 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             or PokeTradeResult.IllegalTrade
             or PokeTradeResult.TrainerRequestBad
             or PokeTradeResult.TrainerTooSlow;
+    }
+
+    /// <summary>
+    /// A successful intermediate team edit-return can reuse SV's still-open trade box.
+    /// Every failure, final trade, capped session, and non-edit-return trade exits normally.
+    /// </summary>
+    public static bool ShouldKeepTeamTradeBoxOpen(
+        PokeTradeType type, int remaining, bool anotherAttemptAllowed, PokeTradeResult result)
+    {
+        return type == PokeTradeType.EditReturn
+            && remaining > 0
+            && anotherAttemptAllowed
+            && result == PokeTradeResult.Success;
     }
 }
