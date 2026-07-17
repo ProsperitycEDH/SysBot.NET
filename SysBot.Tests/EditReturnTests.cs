@@ -130,6 +130,64 @@ public class EditReturnTests
 
     #endregion
 
+    #region IsRemainingTeamOffer
+
+    [Fact]
+    public void IsRemainingTeamOffer_MatchingSpeciesAndForm_Accepts()
+    {
+        var target = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+        var offered = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+        offered.RefreshChecksum();
+
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, offered)
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public void IsRemainingTeamOffer_PreviousSpecies_Rejects()
+    {
+        var target = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+        var offered = new PK9 { Species = (ushort)Species.Mudbray, Form = 0 };
+        offered.RefreshChecksum();
+
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, offered)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRemainingTeamOffer_FormMismatch_Rejects()
+    {
+        var target = new PK9 { Species = (ushort)Species.Tauros, Form = 1 };
+        var offered = new PK9 { Species = (ushort)Species.Tauros, Form = 2 };
+        offered.RefreshChecksum();
+
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, offered)
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRemainingTeamOffer_NullOrEmpty_Rejects()
+    {
+        var target = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+        var empty = new PK9();
+        empty.RefreshChecksum();
+
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, null).Should().BeFalse();
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, empty).Should().BeFalse();
+    }
+
+    [Fact]
+    public void IsRemainingTeamOffer_InvalidChecksum_Rejects()
+    {
+        var target = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+        var offered = new PK9 { Species = (ushort)Species.Skiddo, Form = 0 };
+
+        PokeTradeBotSV.IsRemainingTeamOffer(new[] { target }, offered)
+            .Should().BeFalse();
+    }
+
+    #endregion
+
     #region SelectRandomizedGender
 
     [Theory]

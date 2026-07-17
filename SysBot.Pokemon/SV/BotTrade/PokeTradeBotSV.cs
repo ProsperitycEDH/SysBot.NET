@@ -451,16 +451,30 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return partnerCheck;
         }
 
-        // Hard check to verify that the offset changed from the last thing offered from the previous trade.
-        // This is because box opening times can vary per person, the offset persists between trades, and can also change offset between trades.
-        var tradeOffered = await ReadUntilChanged(TradePartnerOfferedOffset, lastOffered, 10_000, 0_500, false, true, token).ConfigureAwait(false);
-        if (!tradeOffered)
+        PK9? offered;
+        byte[] oldEC;
+        if (continueInBox && poke.EditReturnTargets is { Count: > 0 } remainingTargets)
         {
-            await ExitTradeToPortal(false, token).ConfigureAwait(false);
-            return PokeTradeResult.TrainerTooSlow;
+            var remainingNames = string.Join(", ", remainingTargets.Select(t => GetSpeciesName(t.Species)));
+            poke.SendNotification(this, $"Ready for the next team Pokémon. Offer one of: {remainingNames}.");
+            offered = await ReadUntilRemainingTeamOffer(remainingTargets, token).ConfigureAwait(false);
+            oldEC = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
         }
+        else
+        {
+            // Hard check to verify that the offset changed from the last thing offered from the previous trade.
+            // This is because box opening times can vary per person, the offset persists between trades, and can also change offset between trades.
+            var tradeOffered = await ReadUntilChanged(TradePartnerOfferedOffset, lastOffered, 10_000, 0_500, false, true, token).ConfigureAwait(false);
+            if (!tradeOffered)
+            {
+                await ExitTradeToPortal(false, token).ConfigureAwait(false);
+                return PokeTradeResult.TrainerTooSlow;
+            }
 
-        poke.SendNotification(this, $"Found Link Trade partner: {tradePartner.TrainerName}. Waiting for a Pokémon...");
+            poke.SendNotification(this, $"Found Link Trade partner: {tradePartner.TrainerName}. Waiting for a Pokémon...");
+            offered = await ReadUntilPresent(TradePartnerOfferedOffset, 25_000, 1_000, BoxFormatSlotSize, token).ConfigureAwait(false);
+            oldEC = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
+        }
 
         if (poke.Type == PokeTradeType.Dump)
         {
@@ -469,9 +483,6 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             return result;
         }
 
-        // Wait for user input...
-        var offered = await ReadUntilPresent(TradePartnerOfferedOffset, 25_000, 1_000, BoxFormatSlotSize, token).ConfigureAwait(false);
-        var oldEC = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
         if (offered == null || offered.Species == 0 || !offered.ChecksumValid)
         {
             Log("Trade ended because a valid Pokémon was not offered.");
@@ -559,6 +570,25 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             LastTradeDistributionFixed = false;
         }
         return PokeTradeResult.Success;
+    }
+
+    /// <summary>
+    /// Polls an already-open team trade until the partner offers a species/form that is still
+    /// requested. The just-traded Pokémon can linger in partner-offer memory and must be ignored.
+    /// </summary>
+    private async Task<PK9?> ReadUntilRemainingTeamOffer(IReadOnlyList<PK9> remainingTargets, CancellationToken token)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < 25_000)
+        {
+            var offered = await ReadPokemon(TradePartnerOfferedOffset, BoxFormatSlotSize, token).ConfigureAwait(false);
+            if (IsRemainingTeamOffer(remainingTargets, offered))
+                return offered;
+
+            await Task.Delay(1_000, token).ConfigureAwait(false);
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1427,6 +1457,15 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (targets[i].Species == species && targets[i].Form == form)
                 return i;
         return -1;
+    }
+
+    /// <summary>
+    /// Returns whether an offered Pokémon is valid and matches a remaining team target.
+    /// </summary>
+    public static bool IsRemainingTeamOffer(IReadOnlyList<PK9> targets, PK9? offered)
+    {
+        return offered is { Species: not 0, ChecksumValid: true }
+            && FindTeamTargetIndex(targets, offered.Species, offered.Form) >= 0;
     }
 
     /// <summary>
