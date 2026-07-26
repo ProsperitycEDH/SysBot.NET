@@ -5,6 +5,7 @@ using Xunit;
 
 namespace SysBot.Tests;
 
+[Collection("Generation")]
 public class GenerateTests
 {
     static GenerateTests() => AutoLegalityWrapper.EnsureInitialized(new Pokemon.LegalitySettings());

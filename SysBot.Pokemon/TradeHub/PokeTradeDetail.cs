@@ -57,14 +57,18 @@ public class PokeTradeDetail<TPoke>(TPoke TradeData, PokeTradeTrainerInfo Traine
     public void SendNotification(PokeRoutineExecutor<TPoke> routine, PokeTradeSummary obj) => Notifier.SendNotification(routine, this, obj);
     public void SendNotification(PokeRoutineExecutor<TPoke> routine, TPoke obj, string message) => Notifier.SendNotification(routine, this, obj, message);
 
-    /// <summary>Remaining unconsumed team sets for multi-set edit-return; null means single-mon mode.</summary>
-    public List<TPoke>? EditReturnTargets;
+    /// <summary>
+    /// Remaining unconsumed sets for a multi-trade session. Edit-return only populates this for
+    /// multi-set requests; gen populates it always, since each generated mon is one trade.
+    /// Null means single-mon mode.
+    /// </summary>
+    public List<TPoke>? SessionTargets;
 
-    /// <summary>Species names successfully edited+traded in a team session.</summary>
-    public List<string> EditReturnDone = [];
+    /// <summary>Species names successfully traded in a multi-trade session.</summary>
+    public List<string> SessionDone = [];
 
-    /// <summary>Entries "Species — reason" for sets dropped as illegal in a team session.</summary>
-    public List<string> EditReturnFailed = [];
+    /// <summary>Entries "Species — reason" for sets dropped as illegal in a multi-trade session.</summary>
+    public List<string> SessionFailed = [];
 
     public bool Equals(PokeTradeDetail<TPoke>? other)
     {

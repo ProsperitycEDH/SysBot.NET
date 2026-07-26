@@ -63,9 +63,19 @@ public static class GenBridge<T> where T : PKM, new()
                 return;
             }
 
-            // Only accept POST to /editreturn
-            if (!ctx.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) ||
-                !ctx.Request.Url.LocalPath.Equals("/editreturn", StringComparison.OrdinalIgnoreCase))
+            // Two trade modes: /editreturn edits the player's own mon, /gen builds a new one.
+            bool isGen;
+            if (ctx.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                ctx.Request.Url.LocalPath.Equals("/editreturn", StringComparison.OrdinalIgnoreCase))
+            {
+                isGen = false;
+            }
+            else if (ctx.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) &&
+                     ctx.Request.Url.LocalPath.Equals("/gen", StringComparison.OrdinalIgnoreCase))
+            {
+                isGen = true;
+            }
+            else
             {
                 ctx.Response.StatusCode = 404;
                 ctx.Response.Close();
@@ -102,6 +112,15 @@ public static class GenBridge<T> where T : PKM, new()
                 return;
             }
 
+            // A from-scratch mon carries the host console's trainer, which is only known once the
+            // bot has connected and identified it. Generating before then would ship the
+            // placeholder OT from config, so refuse rather than build a mon nobody wants.
+            if (isGen && !AutoLegalityWrapper.HostTrainerRegistered)
+            {
+                WriteJson(ctx, 503, new { ok = false, error = "the genning rig hasn't finished connecting to the console yet — try again in a minute" });
+                return;
+            }
+
             // Split paste into team chunks
             var chunks = SplitTeamPaste(req.showdownSet);
             if (chunks.Count == 0)
@@ -134,15 +153,29 @@ public static class GenBridge<T> where T : PKM, new()
                 return;
             }
 
-            // Check for duplicate species+form in the team
-            for (int i = 0; i < parsedPkms.Count; i++)
+            if (isGen)
             {
-                for (int j = i + 1; j < parsedPkms.Count; j++)
+                // Duplicates are fine here -- gen consumes its sets in order rather than matching
+                // them against what the player offers -- but fabricated provenance is not.
+                var rejected = CheckGenProvenance(parsedPkms);
+                if (rejected != null)
                 {
-                    if (parsedPkms[i].Species == parsedPkms[j].Species && parsedPkms[i].Form == parsedPkms[j].Form)
+                    WriteJson(ctx, 400, new { ok = false, error = rejected });
+                    return;
+                }
+            }
+            else
+            {
+                // Check for duplicate species+form in the team
+                for (int i = 0; i < parsedPkms.Count; i++)
+                {
+                    for (int j = i + 1; j < parsedPkms.Count; j++)
                     {
-                        WriteJson(ctx, 400, new { ok = false, error = $"duplicate species in team: {SpeciesDisplayName(parsedPkms[i].Species)}" });
-                        return;
+                        if (parsedPkms[i].Species == parsedPkms[j].Species && parsedPkms[i].Form == parsedPkms[j].Form)
+                        {
+                            WriteJson(ctx, 400, new { ok = false, error = $"duplicate species in team: {SpeciesDisplayName(parsedPkms[i].Species)}" });
+                            return;
+                        }
                     }
                 }
             }
@@ -158,12 +191,14 @@ public static class GenBridge<T> where T : PKM, new()
             // Enqueue
             var trainer = new PokeTradeTrainerInfo(req.trainerName, req.discordId);
             var notifier = new WebhookTradeNotifier<T>(pk, trainer, req.code, req.discordId, req.callbackUrl, req.requestId, secret);
-            var detail = new PokeTradeDetail<T>(pk, trainer, notifier, PokeTradeType.EditReturn, req.code, false);
+            var tradeType = isGen ? PokeTradeType.Gen : PokeTradeType.EditReturn;
+            var detail = new PokeTradeDetail<T>(pk, trainer, notifier, tradeType, req.code, false);
 
-            // Team mode: assign all parsed PKMs as targets
-            if (parsedPkms.Count > 1)
+            // Every gen mon is its own trade, so gen always runs the multi-trade session path.
+            // Edit-return only needs it when there is more than one set to match against.
+            if (isGen || parsedPkms.Count > 1)
             {
-                detail.EditReturnTargets = parsedPkms
+                detail.SessionTargets = parsedPkms
                     .Select(p => EntityConverter.ConvertToType(p, typeof(T), out _) ?? p)
                     .Cast<T>()
                     .ToList();
@@ -184,7 +219,7 @@ public static class GenBridge<T> where T : PKM, new()
 
             var speciesNames = parsedPkms.Select(p => SpeciesDisplayName(p.Species)).ToList();
 
-            LogUtil.LogText($"gen bridge: requestId={req.requestId} species={(Species)pk.Species} position={pos.Position}");
+            LogUtil.LogText($"gen bridge: mode={(isGen ? "gen" : "editreturn")} requestId={req.requestId} species={(Species)pk.Species} position={pos.Position}");
 
             WriteJson(ctx, 200, new { ok = true, queued = true, position = pos.Position, count = parsedPkms.Count, species = speciesNames });
         }
@@ -194,6 +229,46 @@ public static class GenBridge<T> where T : PKM, new()
             try { WriteJson(ctx, 500, new { ok = false, error = "internal error" }); }
             catch { /* response may already be closed */ }
         }
+    }
+
+    /// <summary>
+    /// Set GENBRIDGE_ALLOW_EVENT=1 to let from-scratch gen fabricate event/gift Pokémon. Off by
+    /// default: a fabricated event mon is the one class of illegitimacy HOME has demonstrably
+    /// enforced against, and nothing in the league's roster needs one. Turn it on if a future
+    /// Champions roster makes an event-only species draftable.
+    /// </summary>
+    private static bool AllowEventEncounters =>
+        Environment.GetEnvironmentVariable("GENBRIDGE_ALLOW_EVENT") is "1" or "true";
+
+    /// <summary>
+    /// Reject from-scratch sets whose only legal origin is an encounter this bot has no business
+    /// claiming. Everything reaching here is already PKHeX-legal; this is about whether the
+    /// resulting provenance is one the host console could plausibly own.
+    /// </summary>
+    /// <returns>A player-facing rejection reason, or null if every set is acceptable.</returns>
+    public static string? CheckGenProvenance(List<PKM> pkms)
+    {
+        foreach (var pk in pkms)
+        {
+            var name = SpeciesDisplayName(pk.Species);
+            var enc = new LegalityAnalysis(pk).EncounterOriginal;
+
+            if (!pk.CanBeTraded(enc))
+                return $"{name} can't be traded in-game, so I can't deliver one";
+
+            if (AllowEventEncounters)
+                continue;
+
+            if (enc is MysteryGift)
+                return $"{name} only exists as an event distribution, and I don't fabricate event Pokémon. Ask the commissioner if you need one";
+
+            // In-game trades and fixed-OT gifts come with someone else's trainer baked in, which
+            // contradicts a mon this console caught and traded away.
+            if (AutoLegalityWrapper.IsFixedOT(enc, pk))
+                return $"{name}'s only legal origin has a fixed original trainer, so I can't build one that came from this console";
+        }
+
+        return null;
     }
 
     private static string ReadBody(HttpListenerContext ctx)

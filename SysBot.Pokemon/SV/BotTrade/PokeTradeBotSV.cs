@@ -73,6 +73,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             DisplaySID = sav.DisplaySID;
             DisplayTID = sav.DisplayTID;
             RecentTrainerCache.SetRecentTrainer(sav);
+
+            // From-scratch gen must originate from the console that actually trades the mon away,
+            // not the config placeholder OT. Registering here (after the runner's ALM init) makes
+            // the host trainer win, and unblocks the gen bridge.
+            AutoLegalityWrapper.RegisterHostTrainer(sav);
+            Log($"Generated Pokémon will originate from {sav.OT} ({sav.DisplayTID:000000}/{sav.DisplaySID:0000}).");
+
             await InitializeSessionOffsets(token).ConfigureAwait(false);
 
             // Force the bot to go through all the motions again on its first pass.
@@ -190,8 +197,8 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     private async Task PerformTrade(SAV9SV sav, PokeTradeDetail<PK9> detail, PokeRoutineType type, uint priority, CancellationToken token)
     {
         // Team mode: loop for consecutive trades
-        bool teamMode = detail.EditReturnTargets is { Count: > 0 };
-        int initialRemaining = detail.EditReturnTargets?.Count ?? 0;
+        bool teamMode = detail.SessionTargets is { Count: > 0 };
+        int initialRemaining = detail.SessionTargets?.Count ?? 0;
         int attempt = 0;
         int cap = 2 * initialRemaining + 2;
         bool continueInBox = false;
@@ -201,19 +208,19 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             attempt++;
             // Set TradeData for this attempt (first = already set by enqueuer; subsequent = next target)
-            if (attempt > 1 && detail.EditReturnTargets is { Count: > 0 })
-                detail.TradeData = detail.EditReturnTargets[0];
+            if (attempt > 1 && detail.SessionTargets is { Count: > 0 })
+                detail.TradeData = detail.SessionTargets[0];
 
             bool anotherAttemptAllowed = attempt < cap;
             result = await PerformOneTradeAttempt(sav, detail, type, priority, continueInBox, anotherAttemptAllowed, token).ConfigureAwait(false);
 
             // Team mode: check continuation
-            if (teamMode && detail.EditReturnTargets is { Count: > 0 })
+            if (teamMode && detail.SessionTargets is { Count: > 0 })
             {
-                if (ShouldContinueEditReturnSession(detail.EditReturnTargets.Count, attempt, cap, result))
+                if (ShouldContinueEditReturnSession(detail.SessionTargets.Count, attempt, cap, result))
                 {
                     continueInBox = ShouldKeepTeamTradeBoxOpen(
-                        detail.Type, detail.EditReturnTargets.Count, anotherAttemptAllowed, result);
+                        detail.Type, detail.SessionTargets.Count, anotherAttemptAllowed, result);
                     continue;
                 }
             }
@@ -222,20 +229,22 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             break;
         }
 
-        // Session-end summary for team mode
-        if (teamMode)
+        // Session-end summary for multi-mon sessions. A single-mon gen request also carries a
+        // targets list, and its per-trade notifications already say everything a summary would.
+        if (teamMode && initialRemaining > 1)
         {
-            var remaining = detail.EditReturnTargets ?? [];
+            bool gen = detail.Type == PokeTradeType.Gen;
+            var remaining = detail.SessionTargets ?? [];
             var parts = new List<string>();
-            if (detail.EditReturnDone.Count > 0)
-                parts.Add($"edited: {string.Join(", ", detail.EditReturnDone)}");
-            if (detail.EditReturnFailed.Count > 0)
-                parts.Add($"failed: {string.Join("; ", detail.EditReturnFailed)}");
+            if (detail.SessionDone.Count > 0)
+                parts.Add($"{(gen ? "made" : "edited")}: {string.Join(", ", detail.SessionDone)}");
+            if (detail.SessionFailed.Count > 0)
+                parts.Add($"failed: {string.Join("; ", detail.SessionFailed)}");
             if (remaining.Count > 0)
                 parts.Add($"not traded: {string.Join(", ", remaining.Select(t => GetSpeciesName(t.Species)))}");
             var summary = "Team session ended — " + string.Join(", ", parts) + ".";
             if (result == PokeTradeResult.NoTrainerFound && remaining.Count > 0)
-                summary += " Run /gen again with the remaining sets to finish.";
+                summary += $" Run /{(gen ? "gen" : "train")} again with the remaining sets to finish.";
             detail.SendNotification(this, summary);
         }
 
@@ -453,7 +462,22 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
 
         PK9? offered;
         byte[] oldEC;
-        if (continueInBox && poke.EditReturnTargets is { Count: > 0 } remainingTargets)
+        if (continueInBox && poke.Type == PokeTradeType.Gen && poke.SessionTargets is { Count: > 0 } remainingGen)
+        {
+            // Gen has no species to match on -- the partner hands over whatever they can spare --
+            // so the continuation just waits for the offer slot to change to a new selection.
+            poke.SendNotification(this,
+                $"Ready for the next one ({remainingGen.Count} left: {string.Join(", ", remainingGen.Select(t => GetSpeciesName(t.Species)))}). Offer me another Pokémon you don't mind losing.");
+            var nextOffered = await ReadUntilChanged(TradePartnerOfferedOffset, lastOffered, 45_000, 0_500, false, true, token).ConfigureAwait(false);
+            if (!nextOffered)
+            {
+                await ExitTradeToPortal(false, token).ConfigureAwait(false);
+                return PokeTradeResult.TrainerTooSlow;
+            }
+            offered = await ReadUntilPresent(TradePartnerOfferedOffset, 25_000, 1_000, BoxFormatSlotSize, token).ConfigureAwait(false);
+            oldEC = await SwitchConnection.ReadBytesAbsoluteAsync(TradePartnerOfferedOffset, 8, token).ConfigureAwait(false);
+        }
+        else if (continueInBox && poke.SessionTargets is { Count: > 0 } remainingTargets)
         {
             var remainingNames = string.Join(", ", remainingTargets.Select(t => GetSpeciesName(t.Species)));
             poke.SendNotification(this, $"Ready for the next team Pokémon. Offer one of: {remainingNames}.");
@@ -541,6 +565,15 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         // Log for Trade Abuse tracking.
         LogSuccessfulTrades(poke, trainerNID, tradePartner.TrainerName);
 
+        // Edit-return consumes its target while building the edited mon, because a failed edit
+        // still has to drop that set. Gen has nothing to fail on the console side, so its target
+        // is only consumed here -- once the mon has demonstrably left the box.
+        if (poke.Type == PokeTradeType.Gen && poke.SessionTargets is { Count: > 0 } sent)
+        {
+            poke.SessionDone.Add(GetSpeciesName(sent[0].Species));
+            sent.RemoveAt(0);
+        }
+
         bool boxReady = await WaitForPostTradeBox(token).ConfigureAwait(false);
         if (!boxReady)
         {
@@ -549,7 +582,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             await RecoverToOverworld(token).ConfigureAwait(false);
         }
 
-        int remaining = poke.EditReturnTargets?.Count ?? 0;
+        int remaining = poke.SessionTargets?.Count ?? 0;
         if (boxReady && ShouldKeepTeamTradeBoxOpen(poke.Type, remaining, anotherAttemptAllowed, PokeTradeResult.Success))
         {
             // Compare the next attempt against the offer that just completed. If the captain
@@ -633,7 +666,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         {
             var subfolder = poke.Type.ToString().ToLower();
             DumpPokemon(DumpSetting.DumpFolder, subfolder, received); // received by bot
-            if (poke.Type is PokeTradeType.Specific or PokeTradeType.Clone)
+            if (poke.Type is PokeTradeType.Specific or PokeTradeType.Clone or PokeTradeType.Gen)
                 DumpPokemon(DumpSetting.DumpFolder, "traded", toSend); // sent to partner
         }
     }
@@ -1106,6 +1139,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             PokeTradeType.Random => await HandleRandomLedy(sav, poke, offered, toSend, partnerID, token).ConfigureAwait(false),
             PokeTradeType.Clone => await HandleClone(sav, poke, offered, oldEC, token).ConfigureAwait(false),
             PokeTradeType.EditReturn => await HandleEditReturn(sav, poke, offered, toSend, token).ConfigureAwait(false),
+            PokeTradeType.Gen => HandleGen(poke, toSend),
             _ => (toSend, PokeTradeResult.Success),
         };
     }
@@ -1160,11 +1194,55 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         return (clone, PokeTradeResult.Success);
     }
 
+    /// <summary>
+    /// From-scratch gen: the mon was built and legality-checked by the gen bridge and is already
+    /// sitting in the trade box, so the only work left is a last-moment legality re-check before
+    /// it leaves for a real account. Whatever the partner offers is accepted -- there is nothing
+    /// to match against, unlike edit-return.
+    /// </summary>
+    private (PK9 toSend, PokeTradeResult check) HandleGen(PokeTradeDetail<PK9> poke, PK9 toSend)
+    {
+        var species = GetSpeciesName(toSend.Species);
+        var la = new LegalityAnalysis(toSend);
+        if (!la.Valid)
+        {
+            // The bridge already refused illegal sets, so reaching here means the mon changed
+            // between legalization and the trade. Never hand that to a player's account.
+            Log($"Gen request for {poke.Trainer.TrainerName} failed its pre-trade legality re-check: {species}.");
+            Log(la.Report());
+            poke.SendNotification(this, $"Safety check failed on the {species} I built — I won't trade it. Tell the commissioner.");
+            poke.SendNotification(this, CondenseLegalityReport(la.Report()));
+            DropGenTarget(poke, $"{species} — failed pre-trade legality re-check");
+            return (toSend, PokeTradeResult.IllegalTrade);
+        }
+
+        var enc = la.EncounterOriginal;
+        if (!toSend.CanBeTraded(enc))
+        {
+            Log($"Gen request for {poke.Trainer.TrainerName} produced an untradeable {species}.");
+            poke.SendNotification(this, $"{species} can't be traded in-game, so I can't deliver it. Pick a different Pokémon.");
+            DropGenTarget(poke, $"{species} — cannot be traded in-game");
+            return (toSend, PokeTradeResult.IllegalTrade);
+        }
+
+        poke.SendNotification(this, $"**Trading you a {species}** — built to your set.");
+        Log($"Gen: sending {species} (OT {toSend.OriginalTrainerName}, enc {enc?.GetType().Name}) to {poke.Trainer.TrainerName}.");
+        return (toSend, PokeTradeResult.Success);
+    }
+
+    /// <summary>Drop the current gen target from a multi-mon session so it moves on to the next set.</summary>
+    private static void DropGenTarget(PokeTradeDetail<PK9> poke, string reason)
+    {
+        if (poke.SessionTargets is { Count: > 0 } targets)
+            targets.RemoveAt(0);
+        poke.SessionFailed.Add(reason);
+    }
+
     private async Task<(PK9 toSend, PokeTradeResult check)> HandleEditReturn(
         SAV9SV sav, PokeTradeDetail<PK9> poke, PK9 offered, PK9 target, CancellationToken token)
     {
-        // --- Team mode: resolve target from EditReturnTargets ---
-        var targets = poke.EditReturnTargets;
+        // --- Team mode: resolve target from SessionTargets ---
+        var targets = poke.SessionTargets;
         bool teamMode = targets is { Count: > 0 };
         int teamIdx = -1;
         if (teamMode)
@@ -1293,7 +1371,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (teamMode)
             {
                 targets!.RemoveAt(teamIdx);
-                poke.EditReturnFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
+                poke.SessionFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
             }
 
             return (offered, PokeTradeResult.IllegalTrade);
@@ -1332,7 +1410,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
             if (teamMode)
             {
                 targets!.RemoveAt(teamIdx);
-                poke.EditReturnFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
+                poke.SessionFailed.Add($"{(Species)target.Species} — set not legal for your Pokémon");
             }
 
             if (preRepairReport != null)
@@ -1357,7 +1435,7 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
         if (teamMode)
         {
             targets!.RemoveAt(teamIdx);
-            poke.EditReturnDone.Add(GetSpeciesName(target.Species));
+            poke.SessionDone.Add(GetSpeciesName(target.Species));
         }
 
         await Click(A, 0_800, token).ConfigureAwait(false);
@@ -1513,13 +1591,13 @@ public class PokeTradeBotSV(PokeTradeHub<PK9> Hub, PokeBotState Config) : PokeRo
     }
 
     /// <summary>
-    /// A successful intermediate team edit-return can reuse SV's still-open trade box.
-    /// Every failure, final trade, capped session, and non-edit-return trade exits normally.
+    /// A successful intermediate multi-mon trade can reuse SV's still-open trade box.
+    /// Every failure, final trade, capped session, and single-trade type exits normally.
     /// </summary>
     public static bool ShouldKeepTeamTradeBoxOpen(
         PokeTradeType type, int remaining, bool anotherAttemptAllowed, PokeTradeResult result)
     {
-        return type == PokeTradeType.EditReturn
+        return type is PokeTradeType.EditReturn or PokeTradeType.Gen
             && remaining > 0
             && anotherAttemptAllowed
             && result == PokeTradeResult.Success;

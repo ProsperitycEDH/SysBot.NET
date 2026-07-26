@@ -11,6 +11,13 @@ public static class AutoLegalityWrapper
 {
     private static bool Initialized;
 
+    /// <summary>
+    /// True once <see cref="RegisterHostTrainer"/> has replaced the placeholder trainer with the
+    /// console's real one. From-scratch generation must refuse to run before this is set, or the
+    /// mon ships with the <see cref="LegalitySettings.GenerateOT"/> default.
+    /// </summary>
+    public static bool HostTrainerRegistered { get; private set; }
+
     public static void EnsureInitialized(LegalitySettings cfg)
     {
         if (Initialized)
@@ -105,6 +112,52 @@ public static class AutoLegalityWrapper
             Generation = 0,
         };
         return fallback;
+    }
+
+    /// <summary>
+    /// Overwrite the generation trainer database with the connected console's real trainer, so
+    /// Pokémon generated from scratch carry the OT/TID/SID/language of the account that actually
+    /// trades them away instead of the <see cref="LegalitySettings.GenerateOT"/> placeholder.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Registered for every generation/version, not just the host game: Auto-Legality may pick an
+    /// encounter that originates in an older title, and the origin trainer must be the host in that
+    /// case too. Safe to call repeatedly — each call replaces the previous registration.
+    /// </para>
+    /// <para>
+    /// The database is cleared first because registering only appends: the placeholder trainers
+    /// seeded at init would otherwise stay in the pool and get picked at random. This also drops
+    /// anything loaded from <see cref="LegalitySettings.GeneratePathTrainerInfo"/>, which is
+    /// intended — a from-scratch mon must come from the console that trades it.
+    /// </para>
+    /// </remarks>
+    public static void RegisterHostTrainer(ITrainerInfo sav)
+    {
+        TrainerSettings.Clear();
+        TrainerSettings.DefaultOT = sav.OT;
+        TrainerSettings.DefaultTID16 = sav.TID16;
+        TrainerSettings.DefaultSID16 = sav.SID16;
+
+        HostTrainerRegistered = true;
+        for (var context = EntityContext.Gen1; context < EntityContext.MaxInvalid; context++)
+        {
+            if (context == EntityContext.SplitInvalid)
+                continue;
+            var generation = context.Generation;
+            foreach (var version in GameUtil.GetVersionsInGeneration(context, Latest.Version))
+            {
+                TrainerSettings.Register(new SimpleTrainerInfo(version)
+                {
+                    OT = sav.OT,
+                    TID16 = sav.TID16,
+                    SID16 = sav.SID16,
+                    Gender = sav.Gender,
+                    Language = sav.Language,
+                    Generation = generation,
+                });
+            }
+        }
     }
 
     private static void RegisterIfNoneExist(SimpleTrainerInfo fallback, byte generation, GameVersion version)

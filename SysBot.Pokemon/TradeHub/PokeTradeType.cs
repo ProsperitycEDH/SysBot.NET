@@ -8,4 +8,5 @@ public enum PokeTradeType
     Clone,
     Dump,
     EditReturn,
+    Gen,
 }
